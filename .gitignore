@@ -52,3 +52,5 @@ Thumbs.db
 # DATA (REMOVE IF YOU WANT PDFs IN REPO)
 data/
 
+
+frontend/.parcel-cache/
