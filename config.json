@@ -1,0 +1,32 @@
+{
+  "use_cloud_by_default": false,
+  "cloud_provider": "gemini",
+
+  "local_model": {
+    "default_engine": "ollama",
+    "fallback_engine": "llama-cpp",
+    "ollama_model": "mistral",
+    "local_model_path": ".\\models\\mistral-7b\\mistral-7b.ggml.q4_0.bin",
+    "model_path": ".\\models\\mistral-7b\\mistral-7b.ggml.q4_0.bin",
+
+    "use_cloud_fallback": true,
+    "cloud_fallback_min_confidence": 0.55,
+
+    "max_tokens": 2048,
+    "n_ctx": 8192,
+    "temperature": 0.15
+  },
+
+
+  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+
+  "sanitization": {
+    "max_chunk_chars_sent_to_cloud": 1500,
+    "max_chunks_sent_to_cloud": 2,
+    "remove_pii": true
+  },
+
+  "llm_timeout_seconds": 240,
+  "cache_dir": ".\\cache",
+  "logs_dir": ".\\logs"
+}

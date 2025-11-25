@@ -1,0 +1,12 @@
+# requirements.txt
+chromadb>=0.4.22
+sentence-transformers>=2.2.2
+pypdf2>=3.0.1
+torch>=2.0.0
+transformers>=4.30.0
+numpy>=1.21.0
+llama-cpp-python>=0.3.0
+google-generativeai>=0.3.0
+python-dotenv>=1.0.0
+keyring>=24.0
+flask>=2.3.0
