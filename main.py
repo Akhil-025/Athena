@@ -1,11 +1,15 @@
+# main.py 
 import os
 import sys
 import logging
 import json
 from pathlib import Path
-from local_rag import create_rag_system
-from pdf_processor import get_pdf_files_recursive, get_organization_structure
 from dotenv import load_dotenv
+
+# Use the merged RAG implementation
+from local_rag import MergedLocalRAG
+
+from pdf_processor import get_pdf_files_recursive, get_organization_structure
 from utils.sanitize import prepare_context_for_cloud
 from utils.llm_cache import question_hash, load_cached_answer, save_cached_answer
 from llm_wrappers.llm_local import LocalLLM
@@ -18,495 +22,249 @@ except Exception:
 
 load_dotenv()
 
-# Configure logging
+# Configure logging once
+LOGFILE = "athena_prep.log"
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('athena_prep.log', encoding='utf-8')
-    ]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(LOGFILE, encoding="utf-8")]
 )
 logger = logging.getLogger(__name__)
 
-CONFIG = json.load(open(Path(__file__).parent / "config.json"))
+CONFIG_PATH = Path(__file__).parent / "config.json"
+CONFIG = json.load(open(CONFIG_PATH))
 
 class AIIntegration:
     def __init__(self, api_key: str = None):
-        """Initialize AI integration with local and cloud options."""
-        self.client = None
-        self.api_key = api_key or os.getenv('GOOGLE_API_KEY')
-        
-        # Initialize local LLM
+        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         lm_cfg = CONFIG.get("local_model", {})
         engine = lm_cfg.get("default_engine", "ollama").lower()
-
         self.local_llm = None
+        self.cloud_llm = None
 
+        # Local LLM selection
         if engine == "ollama":
             if OllamaLLM is None:
-                logger.warning("❌ Ollama wrapper missing. Make sure llm_wrappers/llm_ollama.py exists.")
+                logger.warning("Ollama wrapper not found (llm_wrappers/llm_ollama.py).")
             else:
                 try:
                     self.local_llm = OllamaLLM(model=lm_cfg.get("ollama_model", "mistral"))
-                    logger.info("✅ Local LLM (Ollama) initialized: %s", lm_cfg.get("ollama_model", "mistral"))
+                    logger.info("Initialized Ollama local LLM.")
                 except Exception as e:
-                    logger.warning(f"❌ Ollama init failed: {e}")
+                    logger.warning("Ollama initialization failed: %s", e)
                     self.local_llm = None
 
         elif engine == "llama-cpp":
-            # initialize llama-cpp wrapper if requested
             try:
                 self.local_llm = LocalLLM(
                     model_path=lm_cfg.get("model_path", lm_cfg.get("local_model_path", "")),
-                    max_tokens=lm_cfg.get("max_tokens",512),
-                    n_ctx=lm_cfg.get("n_ctx",2048),
-                    temperature=lm_cfg.get("temperature",0.0)
+                    max_tokens=lm_cfg.get("max_tokens", 512),
+                    n_ctx=lm_cfg.get("n_ctx", 2048),
+                    temperature=lm_cfg.get("temperature", 0.0),
                 )
-                logger.info("✅ Local LLM (llama-cpp) initialized")
+                logger.info("Initialized llama-cpp local LLM.")
             except Exception as e:
-                logger.warning(f"❌ Local LLM (llama-cpp) not available: {e}")
+                logger.warning("llama-cpp init failed: %s", e)
                 self.local_llm = None
         else:
-            logger.info("ℹ️ No local engine configured; set local_model.default_engine in config.json")
-            self.local_llm = None
-        
-        # Initialize cloud LLM if API key provided
+            logger.info("No local LLM configured in config.json (local_model.default_engine)")
+
+        # Cloud LLM
         if self.api_key:
             try:
-                self.cloud_llm = CloudLLM(
-                    api_key=self.api_key, 
-                    model="gemini-1.5-pro",
-                    max_output_tokens=lm_cfg.get("max_tokens",512)
-                )
-                logger.info("✅ Cloud LLM (Gemini) initialized")
+                self.cloud_llm = CloudLLM(api_key=self.api_key, model=CONFIG.get("cloud_model","gemini-1.5-pro"),
+                                          max_output_tokens=lm_cfg.get("max_tokens", 512))
+                logger.info("Cloud LLM initialized.")
             except Exception as e:
-                logger.warning(f"❌ Cloud LLM init failed: {e}")
+                logger.warning("Cloud LLM init failed: %s", e)
                 self.cloud_llm = None
         else:
-            self.cloud_llm = None
-            logger.warning("❌ GOOGLE_API_KEY not set. Cloud AI will be disabled.")
-    
+            logger.warning("GOOGLE_API_KEY not set; cloud LLM disabled.")
+
     def generate_answer(self, question: str, context: str, use_cloud: bool = False) -> str:
-        """Generate AI answer using local or cloud LLM."""
+        """Return LLM response text; prefer cloud if requested and available."""
         if use_cloud and self.cloud_llm:
-            logger.info("🤖 Using Cloud LLM for answer generation")
-            # Prepare sanitized context for cloud
-            safe_chunks = [{"text": context[:2000], "source": "user_documents"}]  # Truncate for safety
+            logger.info("Using cloud LLM")
+            safe_chunks = [{"text": context[:2000], "source": "user_documents"}]
             safe_ctx = prepare_context_for_cloud(
                 safe_chunks,
                 max_chunks=CONFIG["sanitization"]["max_chunks_sent_to_cloud"],
                 max_chars=CONFIG["sanitization"]["max_chunk_chars_sent_to_cloud"]
             )
-            ctx_text = "\n\n".join([f"Source {i+1} ({c['source']}):\n{c['text']}" for i,c in enumerate(safe_ctx)])
-            
-            prompt = f"""You are Athena — an expert AI study partner.
-                        Provide clear, simple explanations suitable for engineering students.
-                        Answer the question using ONLY the provided context.
+            ctx_text = "\n\n".join([f"Source {i+1} ({c['source']}):\n{c['text']}" for i, c in enumerate(safe_ctx)])
+            prompt = f"You are Athena — an expert AI study partner.\nAnswer using ONLY the provided context.\n\nCONTEXT:\n{ctx_text}\n\nQUESTION: {question}\n\nANSWER:"
+            res = self.cloud_llm.generate(prompt, timeout=CONFIG.get("llm_timeout_seconds", 60))
+            return res.get("text", str(res))
 
-CONTEXT:
-{ctx_text}
+        if self.local_llm:
+            logger.info("Using local LLM")
+            prompt = f"You are an expert engineering tutor. Use the context to answer.\n\nCONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"
+            res = self.local_llm.generate(prompt, timeout=CONFIG.get("llm_timeout_seconds", 60))
+            return res.get("text", str(res))
 
-QUESTION: {question}
-
-ANSWER:"""
-            
-            result = self.cloud_llm.generate(prompt, timeout=CONFIG.get("llm_timeout_seconds",60))
-            return result["text"]
-        
-        elif self.local_llm:
-            logger.info("🤖 Using Local LLM for answer generation")
-            prompt = f"""You are an expert engineering tutor. Use the context to answer the question.
-
-CONTEXT:
-{context}
-
-QUESTION: {question}
-
-ANSWER:"""
-            
-            result = self.local_llm.generate(prompt, timeout=CONFIG.get("llm_timeout_seconds",60))
-            return result["text"]
-        else:
-        # prefer local_llm if available (Ollama or llama-cpp)
-            if self.local_llm:
-                logger.info("🤖 Generating with local LLM")
-                result = self.local_llm.generate(prompt, timeout=CONFIG.get("llm_timeout_seconds",120))
-                return result.get("text", str(result))
-            else:
-                return "❌ No AI provider available locally. Enable Ollama or configure a local GGML model, or use cloud mode."
+        return "❌ No LLM available. Enable local or cloud LLM."
 
 class AthenaApp:
     def __init__(self, data_dir: str = "./data", gemini_api_key: str = None):
         self.data_dir = data_dir
+        # Use improved merged rag with BM25 available by default (toggle in config)
         self.rag = None
         self.ai = AIIntegration(gemini_api_key)
         self.setup_data_directory()
-    
+
     def setup_data_directory(self):
-        """Ensure data directory exists with sample structure."""
         if not os.path.exists(self.data_dir):
-            os.makedirs(self.data_dir)
-            print(f"📁 Created data directory: {self.data_dir}")
+            os.makedirs(self.data_dir, exist_ok=True)
+            logger.info("Created data directory: %s", self.data_dir)
             self._create_sample_structure()
-            return True
         return True
-    
+
     def _create_sample_structure(self):
-        """Create sample folder structure for guidance."""
         sample_structure = {
             "CAD_CAM": ["2D_Transformations", "CNC_Programming", "CAD_Algorithms"],
             "Machine_Design": ["Shafts", "Bearings", "Gears"],
             "Thermodynamics": ["Heat_Transfer", "Cycles"]
         }
-        
         for subject, modules in sample_structure.items():
-            subject_path = os.path.join(self.data_dir, subject)
-            os.makedirs(subject_path, exist_ok=True)
-            
             for module in modules:
-                module_path = os.path.join(subject_path, module)
-                os.makedirs(module_path, exist_ok=True)
-        
-        print("📂 Created sample folder structure:")
-        for subject, modules in sample_structure.items():
-            print(f"   ├── {subject}/")
-            for module in modules:
-                print(f"   │   ├── {module}/")
-        print("\n💡 Add your PDF files to the appropriate subject/module folders")
-    
+                os.makedirs(os.path.join(self.data_dir, subject, module), exist_ok=True)
+        logger.info("Sample folder structure created under %s", self.data_dir)
+        print("📂 Sample folders created. Add PDFs to these folders and re-run.")
+
+    def initialize_rag(self):
+        logger.info("Initializing RAG...")
+        # instantiate MergedLocalRAG from merged_rag.py
+        persist = CONFIG.get("chroma_persist_dir", "./chroma_db")
+        enable_bm25 = CONFIG.get("enable_bm25", True)
+        batch_size = CONFIG.get("embed_batch_size", 32)
+        self.rag = MergedLocalRAG(persist_directory=persist,
+                                  model_name=CONFIG.get("embedding_model", "all-MiniLM-L6-v2"),
+                                  embed_batch_size=batch_size,
+                                  enable_bm25=enable_bm25)
+        # ingest if empty or reload requested
+        stats = self.rag.get_collection_stats()
+        if stats.get("total_chunks", 0) == 0 or CONFIG.get("reload_on_start", False):
+            logger.info("No chunks found or reload requested — ingesting directory")
+            self.rag.ingest_directory(self.data_dir, rebuild_bm25=True)
+        else:
+            logger.info("Using existing DB with %d chunks", stats.get("total_chunks", 0))
+        return True
+
     def auto_answer_question(self, question: str, subject_filter: str = None, module_filter: str = None, use_cloud: bool = False) -> str:
-        """Automatically answer questions using RAG + AI with local/cloud choice."""
-        print(f"   🔍 Searching through documents... ({'Cloud' if use_cloud else 'Local'} mode)")
-        
-        # Search for relevant content
+        print("🔍 Searching documents...")
         results = self.rag.search(question, n_results=8, subject_filter=subject_filter, module_filter=module_filter)
-        
-        if results['total_results'] == 0:
-            return "❌ No relevant information found in your documents to answer this question."
-        
-        # Build comprehensive context
+        if results.get("total_results", 0) == 0:
+            return "❌ No relevant information found in your documents."
+
         context = self.build_context_prompt(question, results)
-        
-        # Check cache first
-        context_ids = [m.get("file_name", "") + f":{i}" for i, m in enumerate(results['metadatas'])]
+        # caching
+        context_ids = [m.get("file_name", "") + f":{i}" for i, m in enumerate(results["metadatas"])]
         qh = question_hash(question, context_ids)
         cached = load_cached_answer(qh)
         if cached:
-            print("   💾 Using cached answer")
-            return cached.get("answer", "Cached answer unavailable")
-        
-        # Generate AI answer
-        if self.ai.local_llm or (use_cloud and self.ai.cloud_llm):
-            print(f"   🤖 Generating AI answer from your documents...")
-            answer = self.ai.generate_answer(question, context, use_cloud=use_cloud)
-            
-            # Cache the result
-            save_cached_answer(qh, {"answer": answer, "sources": [m.get("file_name", "unknown") for m in results['metadatas']]})
-            return answer
-        else:
-            # Fallback: show organized context
-            formatted_results = self.format_search_results(results)
-            out = f"{formatted_results}\n💡 **Context ready for manual analysis**"
-            save_cached_answer(qh, {"answer": out, "sources": [m.get("file_name", "unknown") for m in results['metadatas']]})
-            return out
-    
-    def initialize_rag(self):
-        """Initialize Athena."""
-        try:
-            print("🚀 Initializing Athena...")
-            self.rag = create_rag_system(self.data_dir)
-            
-            # Show detailed statistics
-            org_info = self.rag.get_organization_info()
-            stats = org_info['database_stats']
-            file_structure = org_info['file_structure']
-            
-            pdf_files = get_pdf_files_recursive(self.data_dir)
-            
-            print(f"\n📊 System Status:")
-            print(f"   • PDF Files: {len(pdf_files)}")
-            print(f"   • Knowledge Chunks: {stats['total_chunks']}")
-            print(f"   • Subjects: {len(stats['subjects'])}")
-            print(f"   • Database: {stats['persist_directory']}")
-            print(f"   • Local LLM: {'✅ Available' if self.ai.local_llm else '❌ Unavailable'}")
-            print(f"   • Cloud LLM: {'✅ Available' if self.ai.cloud_llm else '❌ Unavailable'}")
-            
-            if stats['subjects']:
-                print(f"\n📚 Loaded Subjects:")
-                for subject in stats['subjects']:
-                    subject_files = [f for f in pdf_files if f['subject'] == subject]
-                    modules = set(f['module'] for f in subject_files)
-                    print(f"   • {subject}: {len(subject_files)} files in {len(modules)} modules")
-            
-            if stats['total_chunks'] == 0:
-                print("\n❌ No documents loaded. Please add PDF files to the appropriate folders.")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize RAG system: {e}")
-            print(f"❌ Error initializing system: {e}")
-            return False
-    
-    def format_search_results(self, results: dict) -> str:
-        """Format search results for display with organizational info."""
-        if not results or results['total_results'] == 0:
-            filters_text = ""
-            if results['filters']['subject']:
-                filters_text = f" (filtered by: {results['filters']['subject']}"
-                if results['filters']['module']:
-                    filters_text += f" → {results['filters']['module']}"
-                filters_text += ")"
-            return f"❌ No relevant information found in the documents{filters_text}."
-        
-        formatted = f"🔍 Found {results['total_results']} relevant sections"
-        
-        # Show active filters
-        if results['filters']['subject'] or results['filters']['module']:
-            filters = []
-            if results['filters']['subject']:
-                filters.append(f"Subject: {results['filters']['subject']}")
-            if results['filters']['module']:
-                filters.append(f"Module: {results['filters']['module']}")
-            formatted += f" [Filtered: {', '.join(filters)}]"
-        
-        formatted += ":\n\n"
-        
-        for i, (doc, metadata, distance) in enumerate(zip(
-            results['documents'], 
-            results['metadatas'], 
-            results['distances']
-        ), 1):
-            similarity = (1 - distance) * 100
-            formatted += f"{i}. 📚 {metadata['subject']} → {metadata['module']}\n"
-            formatted += f"   📄 {metadata['file_name']} (Page {metadata['page_number']})\n"
-            formatted += f"   📏 Relevance: {similarity:.1f}%\n"
-            formatted += f"   📝 Content: {doc[:200]}...\n\n"
-        
-        return formatted
-    
+            logger.info("Using cached answer")
+            return cached.get("answer", "Cached result unavailable")
+
+        answer = self.ai.generate_answer(question, context, use_cloud=use_cloud)
+        save_cached_answer(qh, {"answer": answer, "sources": [m.get("file_name", "unknown") for m in results["metadatas"]]})
+        return answer
+
     def build_context_prompt(self, question: str, results: dict) -> str:
-        """Build a comprehensive context prompt for LLMs."""
-        if not results or results['total_results'] == 0:
+        if not results or results.get("total_results", 0) == 0:
             return f"Question: {question}\n\nNo relevant context found."
-        
-        context = "Based on the following engineering documents, please answer the question accurately and comprehensively.\n\n"
-        context += "RELEVANT DOCUMENT EXCERPTS:\n"
-        
-        for i, (doc, metadata) in enumerate(zip(results['documents'], results['metadatas']), 1):
-            context += f"\n--- Excerpt {i} from {metadata['subject']} → {metadata['module']} ---\n"
-            context += f"Source: {metadata['file_name']} (Page {metadata['page_number']})\n"
-            context += f"Content: {doc}\n"
-        
-        context += f"\nQUESTION: {question}\n"
-        context += "ANSWER:"
-        
-        return context
-    
-    def show_organization(self):
-        """Display the current organizational structure."""
-        org_info = self.rag.get_organization_info()
-        file_structure = org_info['file_structure']
-        
-        print("\n📁 CURRENT DOCUMENT ORGANIZATION:")
-        print("=" * 60)
-        
-        if not file_structure:
-            print("No documents found in the data directory.")
-            return
-        
-        for subject, modules in file_structure.items():
-            print(f"\n📂 {subject}/")
-            for module, files in modules.items():
-                print(f"   ├── {module}/")
-                for file in files:
-                    print(f"   │   ├── {file}")
-            print(f"   └── ...")
-        
-        print(f"\n📊 Total: {len(file_structure)} subjects, {sum(len(modules) for modules in file_structure.values())} modules")
-    
+
+        ctx = []
+        for i, (doc, md) in enumerate(zip(results["documents"], results["metadatas"]), 1):
+            header = f"--- Excerpt {i}: {md.get('file_name','unknown')} | {md.get('subject','?')} → {md.get('module','?')} (Page {md.get('page_number','?')}) ---"
+            ctx.append(f"{header}\n{doc}")
+        prompt = "Based on the excerpts below, answer the question succinctly and clearly.\n\n" + "\n\n".join(ctx)
+        prompt += f"\n\nQUESTION: {question}\nANSWER:"
+        return prompt
+
+    def format_search_results(self, results: dict) -> str:
+        if not results or results.get("total_results", 0) == 0:
+            return "❌ No results found."
+        lines = [f"🔍 Found {results['total_results']} relevant sections:"]
+        # handle both hybrid and semantic-only responses
+        docs = results.get("documents", [])
+        mds = results.get("metadatas", [])
+        # distances may be semantic-only; fallback to scores if present
+        distances = results.get("distances") or []
+        for i, (d, md) in enumerate(zip(docs, mds), 1):
+            subjects = md.get("subject", "Unknown")
+            module = md.get("module", "General")
+            fname = md.get("file_name", "unknown")
+            page = md.get("page_number", "?")
+            snippet = d[:200].replace("\n", " ")
+            lines.append(f"{i}. {subjects} → {module} | {fname} (Page {page})\n   {snippet}...")
+        return "\n\n".join(lines)
+
+    # interactive_session and main() logic kept similar to your original but leaner
     def interactive_session(self):
-        """Run interactive Q&A session with local/cloud AI options."""
-        print("\n" + "="*80)
-        print("🧠 ATHENA — YOUR AI STUDY PARTNER")
-        print("="*80)
-        print("💡 I understand PDFs, pyqs, notes & textbooks.")
-        print("📚 Using all documents in your organized library")
-        print(f"🤖 Local LLM: {'✅ ENABLED' if self.ai.local_llm else '❌ DISABLED'}")
-        print(f"☁️  Cloud LLM: {'✅ ENABLED' if self.ai.cloud_llm else '❌ DISABLED'}")
-        print("\n🔧 Available Commands:")
-        print("   • Ask any question - I'll search and answer automatically")
-        print("   • 'local' - Use local AI for next question")
-        print("   • 'cloud' - Use cloud AI for next question") 
-        print("   • 'subjects' - Show all loaded subjects and modules")
-        print("   • 'filter subject:NAME' - Focus on specific subject")
-        print("   • 'filter module:NAME' - Focus on specific module") 
-        print("   • 'clear filters' - Search all documents")
-        print("   • 'show sources' - Toggle source visibility on/off")
-        print("   • 'stats' - Show system information")
-        print("   • 'quit' - End the session")
-        print("="*80)
-        
-        current_filters = {'subject': None, 'module': None}
-        show_sources = True
+        if not self.rag:
+            self.initialize_rag()
+        print("\n🧠 ATHENA — Interactive mode (type 'quit' to exit)\n")
+        current_filters = {"subject": None, "module": None}
         use_cloud = CONFIG.get("use_cloud_by_default", False)
-        
+
         while True:
             try:
-                # Show current status
-                filter_display = ""
-                if current_filters['subject']:
-                    filter_display = f" [Focus: {current_filters['subject']}"
-                    if current_filters['module']:
-                        filter_display += f" → {current_filters['module']}"
-                    filter_display += "]"
-                
                 mode_display = "☁️ CLOUD" if use_cloud else "💻 LOCAL"
-                user_input = input(f"\n❓ Ask anything [{mode_display}]{filter_display}: ").strip()
-                
-                if user_input.lower() in ['quit', 'exit', 'q']:
-                    print("\n📚 Good luck with your exam preparation! 🍀")
+                inp = input(f"\n❓ [{mode_display}] Ask: ").strip()
+                if inp.lower() in ("quit", "exit", "q"):
                     break
-                
-                elif user_input.lower() == 'stats':
+                if inp.lower() == "stats":
                     stats = self.rag.get_collection_stats()
-                    pdf_files = get_pdf_files_recursive(self.data_dir)
-                    print(f"\n📊 System Statistics:")
-                    print(f"   • PDF Files: {len(pdf_files)}")
-                    print(f"   • Knowledge Chunks: {stats['total_chunks']}")
-                    print(f"   • Subjects: {len(stats['subjects'])}")
-                    print(f"   • Modules: {len(stats['modules'])}")
-                    print(f"   • Current Mode: {'Cloud' if use_cloud else 'Local'}")
+                    print(f"Chunks: {stats.get('total_chunks',0)} | Subjects: {len(stats.get('subjects',[]))}")
                     continue
-                
-                elif user_input.lower() == 'subjects':
-                    self.show_organization()
-                    continue
-                
-                elif user_input.lower() == 'local':
+                if inp.lower() == "local":
                     use_cloud = False
-                    print("✅ Now using LOCAL AI mode")
+                    print("Switched to LOCAL mode.")
                     continue
-                
-                elif user_input.lower() == 'cloud':
-                    if self.ai.cloud_llm:
-                        use_cloud = True
-                        print("✅ Now using CLOUD AI mode")
-                    else:
-                        print("❌ Cloud AI not available. Set GOOGLE_API_KEY to enable.")
+                if inp.lower() == "cloud":
+                    use_cloud = True
+                    print("Switched to CLOUD mode.")
                     continue
-                
-                elif user_input.lower().startswith('filter subject:'):
-                    subject_name = user_input[15:].strip()
-                    current_filters['subject'] = subject_name if subject_name else None
-                    print(f"✅ Now focusing on: {subject_name}")
+                if inp.lower().startswith("filter subject:"):
+                    current_filters["subject"] = inp.split(":",1)[1].strip()
+                    print("Applied subject filter.")
                     continue
-                
-                elif user_input.lower().startswith('filter module:'):
-                    module_name = user_input[14:].strip()
-                    current_filters['module'] = module_name if module_name else None
-                    print(f"✅ Now focusing on: {module_name}")
+                if inp.lower().startswith("filter module:"):
+                    current_filters["module"] = inp.split(":",1)[1].strip()
+                    print("Applied module filter.")
                     continue
-                
-                elif user_input.lower() == 'clear filters':
-                    current_filters = {'subject': None, 'module': None}
-                    print("✅ Now searching all documents")
+                if not inp:
                     continue
-                
-                elif user_input.lower() == 'show sources':
-                    show_sources = not show_sources
-                    print(f"✅ Source visibility: {'ON' if show_sources else 'OFF'}")
+
+                results = self.rag.search(inp, n_results=8, subject_filter=current_filters["subject"], module_filter=current_filters["module"])
+                if results.get("total_results",0) == 0:
+                    print("❌ No relevant sections found.")
                     continue
-                
-                elif not user_input:
-                    continue
-                
-                # AUTO-ANSWER with local/cloud choice
-                print("\n" + "🔍" + "─" * 78)
-                print(f"🤖 Thinking... ({'Cloud' if use_cloud else 'Local'})")
-                
-                # Perform search with filters
-                results = self.rag.search(
-                    user_input, 
-                    n_results=8,
-                    subject_filter=current_filters['subject'],
-                    module_filter=current_filters['module']
-                )
-                
-                # Generate answer
-                if results['total_results'] > 0:
-                    context_prompt = self.build_context_prompt(user_input, results)
-                    
-                    answer = self.ai.generate_answer(user_input, context_prompt, use_cloud=use_cloud)
-                    print("\n" + "=" * 80)
-                    print(f"🎯 ANSWER FROM YOUR DOCUMENTS ({'CLOUD' if use_cloud else 'LOCAL'}):")
-                    print("=" * 80)
-                    print(answer)
-                    
-                    if show_sources:
-                        print("\n" + "📚 SOURCES USED:")
-                        print("-" * 40)
-                        print(self.format_search_results(results))
-                    
-                else:
-                    print("\n❌ No relevant information found in your documents.")
-                    if current_filters['subject'] or current_filters['module']:
-                        print("💡 Try 'clear filters' to search all documents")
-                
-                print("🔍" + "─" * 78)
-                
+                context = self.build_context_prompt(inp, results)
+                answer = self.ai.generate_answer(inp, context, use_cloud=use_cloud)
+                print("\n" + "="*60)
+                print("ANSWER:\n")
+                print(answer)
+                if CONFIG.get("show_sources_on_answer", True):
+                    print("\nSOURCES:\n")
+                    print(self.format_search_results(results))
+                print("="*60)
             except KeyboardInterrupt:
-                print("\n\n⏹️ Session interrupted. Goodbye!")
+                print("\nInterrupted. Goodbye.")
                 break
             except Exception as e:
-                logger.error(f"Error during interaction: {e}")
-                print(f"❌ An error occurred: {e}")
+                logger.exception("Error during interactive loop: %s", e)
+                print("An error occurred:", e)
 
 def main():
-    """Main application entry point."""
-    # Check for Gemini API key
-    gemini_api_key = os.getenv('GOOGLE_API_KEY')
-    
-    app = AthenaApp(gemini_api_key=gemini_api_key)
-    
-    # Check if data directory has files
-    pdf_files = get_pdf_files_recursive("./data")
-    if not pdf_files:
-        print("❌ No PDF files found in './data' directory.")
-        print("💡 Please organize your PDF files like this:")
-        print("   data/")
-        print("   ├── CAD_CAM/")
-        print("   │   ├── 2D_Transformations/")
-        print("   │   │   └── transformation_problems.pdf")
-        print("   │   └── CNC_Programming/")
-        print("   │       └── g_code_examples.pdf")
-        print("   └── Machine_Design/")
-        print("       └── Shafts/")
-        print("           └── shaft_design.pdf")
+    gemini_key = os.getenv("GOOGLE_API_KEY")
+    app = AthenaApp(gemini_api_key=gemini_key)
+    # ensure PDFs exist
+    pdfs = get_pdf_files_recursive(app.data_dir)
+    if not pdfs:
+        print("No PDFs found in data/. Add files and re-run.")
         return
-    
-    # Show file organization
-    print("📁 Detected File Organization:")
-    subjects = {}
-    for file_info in pdf_files:
-        subject = file_info['subject']
-        if subject not in subjects:
-            subjects[subject] = set()
-        subjects[subject].add(file_info['module'])
-    
-    for subject, modules in subjects.items():
-        print(f"   📂 {subject}/")
-        for module in modules:
-            module_files = [f for f in pdf_files if f['subject'] == subject and f['module'] == module]
-            print(f"      ├── {module}/ ({len(module_files)} files)")
-    
-    # Initialize RAG system
-    if not app.initialize_rag():
-        return
-    
-    # Start interactive session
+    app.initialize_rag()
     app.interactive_session()
 
 if __name__ == "__main__":

@@ -8,15 +8,12 @@
     "ollama_model": "mistral",
     "local_model_path": ".\\models\\mistral-7b\\mistral-7b.ggml.q4_0.bin",
     "model_path": ".\\models\\mistral-7b\\mistral-7b.ggml.q4_0.bin",
-
     "use_cloud_fallback": true,
     "cloud_fallback_min_confidence": 0.55,
-
     "max_tokens": 2048,
     "n_ctx": 8192,
     "temperature": 0.15
   },
-
 
   "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
 
@@ -28,5 +25,18 @@
 
   "llm_timeout_seconds": 240,
   "cache_dir": ".\\cache",
-  "logs_dir": ".\\logs"
+  "logs_dir": ".\\logs",
+
+  "chroma_persist_dir": "./chroma_db",
+  "enable_bm25": true,
+  "embed_batch_size": 32,
+  "reload_on_start": false,
+  "show_sources_on_answer": true,
+
+  "server": {
+    "host": "127.0.0.1",
+    "port": 5000,
+    "debug": false,
+    "api_key_for_admin": ""   
+  }
 }

@@ -1,340 +1,611 @@
-import React, { useState } from "react";
-import { createRoot } from "react-dom/client";
+import React, { useEffect, useState, useCallback } from "react";
+import {
+  MessageSquare,
+  Zap,
+  Database,
+  Settings,
+  Send,
+  Mic,
+  Download,
+  Search,
+  Brain,
+  Cpu,
+  ChevronRight,
+  Clock,
+  Sparkles,
+  Sun,
+  Moon
+} from "lucide-react";
 
-function App() {
-  const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState("");
+import { API_URL, ASK_ENDPOINT, STATS_ENDPOINT, STREAM_ENDPOINT } from "./config";
+import { fetchStats, askQuestionAPI, askQuestionStream } from "./utils/api";
+import useLocalStorage from "./hooks/useLocalStorage";
+import useHotkeys from "./hooks/useHotkeys";
+
+export default function App() {
+  // Persistent state
+  const [conversation, setConversation] = useLocalStorage("athena:conversation", []);
+  const [useCloud, setUseCloud] = useLocalStorage("athena:useCloud", false);
+  const [theme, setTheme] = useLocalStorage("athena:theme", "dark");
+  const [agents] = useLocalStorage("athena:agents", [
+    "Researcher",
+    "Teacher",
+    "Simplifier",
+    "Critic"
+  ]);
+  const [currentAgent, setCurrentAgent] = useLocalStorage("athena:agent", "Researcher");
+  const [models] = useLocalStorage("athena:models", [
+    "mistral",
+    "llama",
+    "gemini",
+    "gpt-4"
+  ]);
+  const [currentModel, setCurrentModel] = useLocalStorage("athena:model", "mistral");
+
+  // Ephemeral state
   const [loading, setLoading] = useState(false);
-  const [useCloud, setUseCloud] = useState(false);
-  const [conversation, setConversation] = useState([]);
+  const [stats, setStats] = useState({
+    subjects: [],
+    modules: [],
+    total_chunks: 0
+  });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [latency, setLatency] = useState(null);
+  const [question, setQuestion] = useState("");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
-  async function askQuestion() {
-    if (!question.trim()) return;
-    
-    setLoading(true);
-    const userQuestion = question;
-    setQuestion(""); // Clear input immediately
-    
-    // Add user question to conversation
-    const newConversation = [...conversation, { type: 'user', content: userQuestion }];
-    setConversation(newConversation);
-    
-    try {
-      const response = await fetch("http://127.0.0.1:5000/api/ask", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          question: userQuestion,
-          use_cloud: useCloud
-        }),
-      });
-      
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+  // --- DARK MODE HANDLING ---
+  useEffect(() => {
+    if (theme === "dark") {
+      document.documentElement.classList.add("dark");
+    } else {
+      document.documentElement.classList.remove("dark");
+    }
+  }, [theme]);
+
+  // --- RAG STATS FETCH ---
+  useEffect(() => {
+    (async () => {
+      const s = await fetchStats(API_URL + STATS_ENDPOINT);
+      if (s) setStats(s);
+    })();
+  }, []);
+
+  // --- HOTKEYS (optional, can extend later) ---
+  useHotkeys({
+    "ctrl.'": () => setSettingsOpen((v) => !v)
+  });
+
+  // --- MAIN SEND FUNCTION (STREAMING + FALLBACK) ---
+  const sendQuestion = useCallback(
+    async (raw) => {
+      const q = (raw || question || "").trim();
+      if (!q || loading) return;
+
+      // push user message
+      const userMsg = {
+        id: Date.now() + "_u",
+        type: "user",
+        content: q,
+        time: Date.now()
+      };
+      setConversation((prev) => [...prev, userMsg]);
+      setQuestion("");
+      setLoading(true);
+      setLatency(null);
+      const start = Date.now();
+
+      // helper to add / update streaming chunk
+      const pushStreamChunk = (chunk) => {
+        setConversation((prev) => {
+          const last = prev[prev.length - 1];
+          if (last && last.type === "stream" && !last.done) {
+            const updated = [...prev];
+            updated[updated.length - 1] = {
+              ...last,
+              content: (last.content || "") + chunk
+            };
+            return updated;
+          }
+          return [
+            ...prev,
+            {
+              id: Date.now() + "_s",
+              type: "stream",
+              content: chunk,
+              time: Date.now(),
+              done: false
+            }
+          ];
+        });
+      };
+
+      // 1) Try streaming endpoint
+      try {
+        const result = await askQuestionStream(
+          API_URL + STREAM_ENDPOINT,
+          {
+            question: q,
+            use_cloud: useCloud,
+            model: currentModel,
+            agent: currentAgent
+          },
+          pushStreamChunk
+        );
+
+        const final = result || {};
+        const duration = Date.now() - start;
+
+        setConversation((prev) => {
+          const withDone = prev.map((m) =>
+            m.type === "stream" ? { ...m, done: true } : m
+          );
+          return [
+            ...withDone,
+            {
+              id: Date.now() + "_a",
+              type: "ai",
+              content: final.text || "(no content)",
+              sources: final.sources || [],
+              cached: final.cached || false,
+              mode: final.mode || (useCloud ? "cloud" : "local"),
+              meta: { duration }
+            }
+          ];
+        });
+
+        setLatency(duration);
+        setLoading(false);
+        return;
+      } catch (err) {
+        console.warn("Streaming failed, using fallback:", err);
       }
-      
-      const data = await response.json();
-      
-      // Add AI response to conversation
-      setConversation(prev => [...prev, { 
-        type: 'ai', 
-        content: data.answer,
-        mode: data.mode 
-      }]);
-      
-    } catch (error) {
-      console.error("Error:", error);
-      setConversation(prev => [...prev, { 
-        type: 'error', 
-        content: `Failed to get answer: ${error.message}` 
-      }]);
-    } finally {
-      setLoading(false);
-    }
-  }
 
-  const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      askQuestion();
-    }
-  };
+      // 2) Fallback to non-streaming /api/ask
+      try {
+        const res = await askQuestionAPI(API_URL + ASK_ENDPOINT, {
+          question: q,
+          use_cloud: useCloud,
+          model: currentModel,
+          agent: currentAgent
+        });
+        const duration = Date.now() - start;
 
-  const clearConversation = () => {
-    setConversation([]);
-    setAnswer("");
-  };
+        setConversation((prev) => [
+          ...prev,
+          {
+            id: Date.now() + "_a",
+            type: "ai",
+            content: res.answer || "(no answer)",
+            sources: res.sources || [],
+            cached: res.cached || false,
+            mode: res.mode || (useCloud ? "cloud" : "local"),
+            meta: { duration }
+          }
+        ]);
+        setLatency(duration);
+      } catch (e) {
+        setConversation((prev) => [
+          ...prev,
+          {
+            id: Date.now() + "_err",
+            type: "error",
+            content: "Error: " + (e?.message || e),
+            time: Date.now()
+          }
+        ]);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [question, loading, useCloud, currentModel, currentAgent, setConversation]
+  );
+
+  // --- RENDER ---
 
   return (
-    <div style={{
-      minHeight: '100vh',
-      background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-      padding: '20px',
-      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif'
-    }}>
-      <div style={{
-        maxWidth: '900px',
-        margin: '0 auto',
-        background: 'white',
-        borderRadius: '20px',
-        boxShadow: '0 20px 40px rgba(0,0,0,0.1)',
-        overflow: 'hidden'
-      }}>
-        {/* Header */}
-        <div style={{
-          background: 'linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%)',
-          color: 'white',
-          padding: '30px',
-          textAlign: 'center'
-        }}>
-          <h1 style={{ margin: '0 0 10px 0', fontSize: '2.5rem', fontWeight: '700' }}>
-            CADCAM Study Assistant
-          </h1>
-          <p style={{ margin: 0, opacity: 0.9, fontSize: '1.1rem' }}>
-            Local-First AI with Optional Cloud Enhancement
-          </p>
-        </div>
+    <div className="flex h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white overflow-hidden">
+      {/* Animated background blobs */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute top-1/4 -left-32 w-96 h-96 bg-violet-500/10 rounded-full blur-3xl animate-pulse" />
+        <div
+          className="absolute bottom-1/4 -right-32 w-96 h-96 bg-cyan-500/10 rounded-full blur-3xl animate-pulse"
+          style={{ animationDelay: "1s" }}
+        />
+      </div>
 
-        {/* Controls */}
-        <div style={{
-          padding: '20px',
-          borderBottom: '1px solid #e5e7eb',
-          background: '#f8fafc'
-        }}>
-          <div style={{
-            display: 'flex',
-            gap: '15px',
-            alignItems: 'center',
-            flexWrap: 'wrap'
-          }}>
-            <label style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              cursor: 'pointer',
-              padding: '10px 15px',
-              background: useCloud ? '#dcfce7' : '#f1f5f9',
-              borderRadius: '10px',
-              border: `2px solid ${useCloud ? '#22c55e' : '#cbd5e1'}`,
-              fontWeight: '600',
-              color: useCloud ? '#166534' : '#475569'
-            }}>
-              <input
-                type="checkbox"
-                checked={useCloud}
-                onChange={(e) => setUseCloud(e.target.checked)}
-                style={{ display: 'none' }}
-              />
-              <div style={{
-                width: '20px',
-                height: '20px',
-                borderRadius: '50%',
-                background: useCloud ? '#22c55e' : '#94a3b8',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                color: 'white',
-                fontSize: '12px'
-              }}>
-                {useCloud ? '✓' : ''}
+      {/* LEFT SIDEBAR */}
+      <aside
+        className={`relative flex flex-col border-r border-white/5 bg-black/40 backdrop-blur-xl transition-all duration-300 ${
+          sidebarCollapsed ? "w-16" : "w-72"
+        }`}
+      >
+        {/* Logo + Collapse */}
+        <div className="flex items-center justify-between p-4 border-b border-white/5">
+          {!sidebarCollapsed && (
+            <div className="flex items-center gap-2">
+              <div className="w-8 h-8 bg-gradient-to-br from-violet-500 to-cyan-500 rounded-lg flex items-center justify-center">
+                <Brain className="w-5 h-5" />
               </div>
-              ☁️ Use Cloud AI
-            </label>
-
-            <button
-              onClick={clearConversation}
-              style={{
-                padding: '10px 20px',
-                background: '#ef4444',
-                color: 'white',
-                border: 'none',
-                borderRadius: '10px',
-                cursor: 'pointer',
-                fontWeight: '600',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '8px'
-              }}
-            >
-              🗑️ Clear Chat
-            </button>
-
-            <div style={{
-              marginLeft: 'auto',
-              padding: '8px 16px',
-              background: useCloud ? '#fef3c7' : '#dbeafe',
-              color: useCloud ? '#92400e' : '#1e40af',
-              borderRadius: '8px',
-              fontWeight: '600',
-              fontSize: '14px'
-            }}>
-              {useCloud ? '☁️ Cloud Mode' : '💻 Local Mode'}
-            </div>
-          </div>
-        </div>
-
-        {/* Conversation */}
-        <div style={{
-          height: '500px',
-          overflowY: 'auto',
-          padding: '20px',
-          background: '#f8fafc'
-        }}>
-          {conversation.length === 0 ? (
-            <div style={{
-              textAlign: 'center',
-              color: '#64748b',
-              padding: '60px 20px'
-            }}>
-              <div style={{ fontSize: '4rem', marginBottom: '20px' }}>🎓</div>
-              <h3 style={{ marginBottom: '10px', color: '#475569' }}>
-                Welcome to CADCAM Study Assistant!
-              </h3>
-              <p>Ask questions about CAD/CAM, CNC programming, transformations, and more.</p>
-              <p style={{ marginTop: '10px', fontSize: '14px', opacity: 0.7 }}>
-                Toggle cloud mode for enhanced answers (requires GOOGLE_API_KEY)
-              </p>
-            </div>
-          ) : (
-            conversation.map((item, index) => (
-              <div
-                key={index}
-                style={{
-                  marginBottom: '20px',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  alignItems: item.type === 'user' ? 'flex-end' : 'flex-start'
-                }}
-              >
-                <div style={{
-                  maxWidth: '80%',
-                  padding: '15px 20px',
-                  borderRadius: '20px',
-                  background: item.type === 'user' 
-                    ? 'linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%)' 
-                    : item.type === 'error' ? '#fef2f2' : '#ffffff',
-                  color: item.type === 'user' ? 'white' : '#1f2937',
-                  border: item.type === 'error' ? '1px solid #fecaca' : '1px solid #e5e7eb',
-                  boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-word'
-                }}>
-                  {item.type === 'ai' && (
-                    <div style={{
-                      fontSize: '12px',
-                      fontWeight: '600',
-                      marginBottom: '8px',
-                      color: useCloud ? '#059669' : '#2563eb',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '6px'
-                    }}>
-                      {useCloud ? '☁️' : '💻'} 
-                      {useCloud ? 'Cloud AI' : 'Local AI'}
-                    </div>
-                  )}
-                  {item.content}
-                </div>
-              </div>
-            ))
-          )}
-          {loading && (
-            <div style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '10px',
-              padding: '15px 20px',
-              background: 'white',
-              borderRadius: '20px',
-              border: '1px solid #e5e7eb',
-              marginBottom: '20px',
-              maxWidth: 'fit-content'
-            }}>
-              <div style={{
-                width: '20px',
-                height: '20px',
-                border: '2px solid #e5e7eb',
-                borderTop: '2px solid #4f46e5',
-                borderRadius: '50%',
-                animation: 'spin 1s linear infinite'
-              }}></div>
-              <span style={{ color: '#6b7280', fontWeight: '600' }}>
-                Thinking{useCloud ? ' with Cloud AI' : ' Locally'}...
+              <span className="font-bold text-lg bg-gradient-to-r from-violet-400 to-cyan-400 bg-clip-text text-transparent">
+                ATHENA
               </span>
             </div>
           )}
+          <button
+            onClick={() => setSidebarCollapsed((v) => !v)}
+            className="p-1.5 hover:bg-white/5 rounded-lg transition-colors"
+          >
+            <ChevronRight
+              className={`w-4 h-4 transition-transform ${
+                sidebarCollapsed ? "" : "rotate-180"
+              }`}
+            />
+          </button>
         </div>
 
-        {/* Input Area */}
-        <div style={{
-          padding: '20px',
-          borderTop: '1px solid #e5e7eb',
-          background: 'white'
-        }}>
-          <div style={{
-            display: 'flex',
-            gap: '10px',
-            alignItems: 'flex-end'
-          }}>
-            <textarea
-              value={question}
-              onChange={(e) => setQuestion(e.target.value)}
-              onKeyPress={handleKeyPress}
-              placeholder="Ask about CAD/CAM, CNC programming, transformations..."
-              style={{
-                flex: 1,
-                padding: '15px',
-                border: '2px solid #e5e7eb',
-                borderRadius: '15px',
-                resize: 'none',
-                fontFamily: 'inherit',
-                fontSize: '16px',
-                minHeight: '60px',
-                maxHeight: '120px'
-              }}
-              rows="2"
-            />
-            <button
-              onClick={askQuestion}
-              disabled={loading || !question.trim()}
-              style={{
-                padding: '15px 25px',
-                background: question.trim() && !loading 
-                  ? 'linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%)' 
-                  : '#9ca3af',
-                color: 'white',
-                border: 'none',
-                borderRadius: '15px',
-                cursor: question.trim() && !loading ? 'pointer' : 'not-allowed',
-                fontWeight: '600',
-                fontSize: '16px',
-                minWidth: '100px'
-              }}
-            >
-              {loading ? '⏳' : '🚀'} Ask
-            </button>
+        {/* Sidebar content (hidden when collapsed) */}
+        {!sidebarCollapsed && (
+          <>
+            {/* Quick Stats */}
+            <div className="p-4 space-y-3">
+              <div className="bg-gradient-to-r from-violet-500/10 to-cyan-500/10 rounded-xl p-4 border border-white/5">
+                <div className="flex items-center gap-2 mb-3">
+                  <Database className="w-4 h-4 text-cyan-400" />
+                  <span className="text-xs font-medium text-slate-300">
+                    Knowledge Base
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-3 text-center">
+                  <div>
+                    <div className="text-xl font-bold text-white">
+                      {stats.subjects?.length || 0}
+                    </div>
+                    <div className="text-xs text-slate-400">Subjects</div>
+                  </div>
+                  <div>
+                    <div className="text-xl font-bold text-white">
+                      {stats.modules?.length || 0}
+                    </div>
+                    <div className="text-xs text-slate-400">Modules</div>
+                  </div>
+                  <div>
+                    <div className="text-xl font-bold text-white">
+                      {((stats.total_chunks || 0) / 1000).toFixed(1)}k
+                    </div>
+                    <div className="text-xs text-slate-400">Chunks</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Latency */}
+              <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg border border-white/5">
+                <div className="flex items-center gap-2">
+                  <Zap className="w-4 h-4 text-yellow-400" />
+                  <span className="text-sm text-slate-300">Latency</span>
+                </div>
+                <span className="text-sm font-mono font-bold text-green-400">
+                  {latency != null ? `${latency}ms` : "—"}
+                </span>
+              </div>
+            </div>
+
+            {/* Agent & Model selection */}
+            <div className="flex-1 overflow-y-auto px-4 pb-4 space-y-4">
+              <div>
+                <label className="text-xs uppercase text-slate-500 font-semibold mb-2 block">
+                  Active Agent
+                </label>
+                <div className="space-y-1">
+                  {agents.map((agent) => (
+                    <button
+                      key={agent}
+                      onClick={() => setCurrentAgent(agent)}
+                      className={`w-full text-left px-3 py-2 rounded-lg transition-all ${
+                        currentAgent === agent
+                          ? "bg-gradient-to-r from-violet-500/20 to-cyan-500/20 border border-violet-500/30 text-white"
+                          : "hover:bg-white/5 text-slate-400 border border-transparent"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <Brain className="w-4 h-4" />
+                        <span className="text-sm font-medium">{agent}</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs uppercase text-slate-500 font-semibold mb-2 block">
+                  Model
+                </label>
+                <div className="space-y-1">
+                  {models.map((model) => (
+                    <button
+                      key={model}
+                      onClick={() => setCurrentModel(model)}
+                      className={`w-full text-left px-3 py-2 rounded-lg transition-all ${
+                        currentModel === model
+                          ? "bg-gradient-to-r from-violet-500/20 to-cyan-500/20 border border-violet-500/30 text-white"
+                          : "hover:bg-white/5 text-slate-400 border border-transparent"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <Cpu className="w-4 h-4" />
+                        <span className="text-sm font-medium">{model}</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Settings Button */}
+            <div className="p-4 border-t border-white/5">
+              <button
+                onClick={() => setSettingsOpen(true)}
+                className="w-full flex items-center gap-2 px-4 py-2.5 bg-white/5 hover:bg-white/10 rounded-lg transition-colors"
+              >
+                <Settings className="w-4 h-4" />
+                <span className="text-sm font-medium">Settings</span>
+              </button>
+            </div>
+          </>
+        )}
+      </aside>
+
+      {/* MAIN COLUMN */}
+      <div className="flex-1 flex flex-col overflow-hidden">
+        {/* TOP HEADER */}
+        <header className="flex items-center justify-between px-6 py-4 border-b border-white/5 bg-black/20 backdrop-blur-xl">
+          <div className="flex items-center gap-4">
+            <h1 className="text-2xl font-bold bg-gradient-to-r from-violet-400 via-purple-400 to-cyan-400 bg-clip-text text-transparent">
+              Ultra Intelligence
+            </h1>
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-green-500/10 border border-green-500/20">
+              <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
+              <span className="text-xs font-medium text-green-400">
+                Local · Private
+              </span>
+            </div>
           </div>
-          <div style={{
-            fontSize: '12px',
-            color: '#6b7280',
-            marginTop: '8px',
-            textAlign: 'center'
-          }}>
-            Press Enter to send, Shift+Enter for new line
+
+          <div className="flex items-center gap-3">
+            {/* Theme toggle */}
+            <button
+              onClick={() =>
+                setTheme((t) => (t === "dark" ? "light" : "dark"))
+            }
+              className="p-2 hover:bg-white/5 rounded-lg transition-colors"
+              title="Toggle theme"
+            >
+              {theme === "dark" ? (
+                <Moon className="w-5 h-5 text-slate-300" />
+              ) : (
+                <Sun className="w-5 h-5 text-yellow-300" />
+              )}
+            </button>
+
+            {/* Placeholder controls (hook up later if you want) */}
+            <button
+              className="p-2 hover:bg-white/5 rounded-lg transition-colors"
+              title="Voice Input"
+            >
+              <Mic className="w-5 h-5 text-slate-400 hover:text-white" />
+            </button>
+            <button
+              className="p-2 hover:bg-white/5 rounded-lg transition-colors"
+              title="Export"
+            >
+              <Download className="w-5 h-5 text-slate-400 hover:text-white" />
+            </button>
+            <button
+              className="p-2 hover:bg-white/5 rounded-lg transition-colors"
+              title="Search"
+            >
+              <Search className="w-5 h-5 text-slate-400 hover:text-white" />
+            </button>
+
+            {/* Local / Cloud toggle */}
+            <div className="flex items-center gap-1 p-1 bg-white/5 rounded-lg">
+              <button
+                onClick={() => setUseCloud(false)}
+                className={`px-3 py-1.5 rounded text-xs font-medium transition-all ${
+                  !useCloud
+                    ? "bg-violet-500 text-white"
+                    : "text-slate-400 hover:text-white"
+                }`}
+              >
+                Local
+              </button>
+              <button
+                onClick={() => setUseCloud(true)}
+                className={`px-3 py-1.5 rounded text-xs font-medium transition-all ${
+                  useCloud
+                    ? "bg-cyan-500 text-white"
+                    : "text-slate-400 hover:text-white"
+                }`}
+              >
+                Cloud
+              </button>
+            </div>
+          </div>
+        </header>
+
+        {/* CHAT SCROLL AREA */}
+        <div className="flex-1 overflow-y-auto px-6 py-6 space-y-6">
+          {conversation.length === 0 && !loading && (
+            <div className="flex flex-col items-center justify-center h-full">
+              <div className="w-20 h-20 bg-gradient-to-br from-violet-500 to-cyan-500 rounded-2xl flex items-center justify-center mb-6">
+                <Sparkles className="w-10 h-10 text-white" />
+              </div>
+              <h2 className="text-3xl font-bold mb-2">
+                How can I help you today?
+              </h2>
+              <p className="text-slate-400 text-center max-w-md">
+                Ask anything from your PDFs, notes, and textbooks. Athena will
+                search your knowledge base, retrieve sources, and explain.
+              </p>
+            </div>
+          )}
+
+          {conversation.map((msg) => {
+            const isUser = msg.type === "user";
+            const isAI = msg.type === "ai" || msg.type === "stream";
+            const isError = msg.type === "error";
+
+            return (
+              <div
+                key={msg.id}
+                className={`flex gap-4 ${
+                  isUser ? "justify-end" : "justify-start"
+                }`}
+              >
+                {isAI && (
+                  <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-cyan-500 flex items-center justify-center flex-shrink-0">
+                    <Brain className="w-5 h-5 text-white" />
+                  </div>
+                )}
+
+                <div
+                  className={`flex flex-col max-w-3xl ${
+                    isUser ? "items-end" : "items-start"
+                  }`}
+                >
+                  <div
+                    className={`rounded-2xl px-5 py-3 ${
+                      isUser
+                        ? "bg-gradient-to-r from-violet-500 to-cyan-500 text-white"
+                        : isError
+                        ? "bg-red-900/60 border border-red-500/50 text-red-50"
+                        : "bg-white/5 border border-white/10 backdrop-blur-xl"
+                    }`}
+                  >
+                    <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                      {msg.content}
+                    </p>
+                    {msg.type === "stream" && !msg.done && (
+                      <div className="mt-2 text-xs text-slate-400">
+                        ⏳ streaming…
+                      </div>
+                    )}
+                  </div>
+
+                  {msg.type === "ai" && msg.sources?.length > 0 && (
+                    <div className="flex flex-wrap gap-2 mt-2">
+                      {msg.sources.map((source, i) => (
+                        <span
+                          key={i}
+                          className="text-xs px-2 py-1 bg-white/5 rounded-full text-slate-400 border border-white/10"
+                        >
+                          {source.file_name} · p.{source.page}
+                        </span>
+
+                      ))}
+                    </div>
+                  )}
+
+                  {msg.meta?.duration && (
+                    <div className="flex items-center gap-2 mt-1 text-xs text-slate-500">
+                      <Clock className="w-3 h-3" />
+                      <span>{msg.meta.duration}ms</span>
+                    </div>
+                  )}
+                </div>
+
+                {isUser && (
+                  <div className="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center flex-shrink-0">
+                    <MessageSquare className="w-5 h-5 text-slate-400" />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {/* generic loading indicator in addition to streaming bubble */}
+          {loading && (
+            <div className="flex gap-4">
+              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-cyan-500 flex items-center justify-center flex-shrink-0">
+                <Brain className="w-5 h-5 text-white animate-pulse" />
+              </div>
+              <div className="flex gap-2 items-center bg-white/5 border border-white/10 rounded-2xl px-5 py-3">
+                <div className="w-2 h-2 bg-violet-400 rounded-full animate-bounce" />
+                <div
+                  className="w-2 h-2 bg-purple-400 rounded-full animate-bounce"
+                  style={{ animationDelay: "0.1s" }}
+                />
+                <div
+                  className="w-2 h-2 bg-cyan-400 rounded-full animate-bounce"
+                  style={{ animationDelay: "0.2s" }}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* INPUT BAR */}
+        <div className="border-t border-white/5 bg-black/20 backdrop-blur-xl p-6">
+          <div className="max-w-4xl mx-auto">
+            <div className="relative">
+              <input
+                type="text"
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    sendQuestion(e.currentTarget.value);
+                  }
+                }}
+                placeholder="Ask anything from your library…"
+                disabled={loading}
+                className="w-full px-6 py-4 bg-white/5 border border-white/10 rounded-2xl text-white placeholder-slate-500 focus:outline-none focus:border-violet-500/50 focus:bg-white/10 transition-all disabled:opacity-50"
+              />
+              <button
+                onClick={() => sendQuestion(question)}
+                disabled={loading || !question.trim()}
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-3 bg-gradient-to-r from-violet-500 to-cyan-500 rounded-xl hover:shadow-lg hover:shadow-violet-500/25 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Send className="w-5 h-5 text-white" />
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between mt-3 text-xs text-slate-500">
+              <span>
+                Powered by {currentModel} · {currentAgent} mode ·{" "}
+                {useCloud ? "Cloud" : "Local"} RAG
+              </span>
+              <span>Press Enter to send • Shift+Enter for new line (soon)</span>
+            </div>
           </div>
         </div>
       </div>
 
-      <style>{`
-        @keyframes spin {
-          0% { transform: rotate(0deg); }
-          100% { transform: rotate(360deg); }
-        }
-      `}</style>
+      {/* SETTINGS MODAL */}
+      {settingsOpen && (
+        <div
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50"
+          onClick={() => setSettingsOpen(false)}
+        >
+          <div
+            className="bg-slate-900 border border-white/10 rounded-2xl p-6 max-w-md w-full mx-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-xl font-bold mb-2">Settings</h3>
+            <p className="text-slate-400 text-sm mb-4">
+              Future: tune BM25 vs semantic weight, chunk size, timeouts, cloud
+              usage and more.
+            </p>
+            <button
+              onClick={() => setSettingsOpen(false)}
+              className="w-full px-4 py-2 bg-violet-500 hover:bg-violet-600 rounded-lg transition-colors"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
-
-createRoot(document.getElementById('root')).render(<App />);

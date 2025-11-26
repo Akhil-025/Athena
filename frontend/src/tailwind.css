@@ -1,0 +1,10 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --athena-accent: #6d28d9;
+}
+
+/* Minor visual helpers */
+.bg-athena-900 { background: linear-gradient(180deg,#071029 0%, #0f1724 70%); }

@@ -1,9 +1,15 @@
-# IGNORE SECRETS
+##############################
+# 🔒  SECRETS (Never Commit)
+##############################
 .env
 .env.*
 !env.example
+*.key
+*.pem
 
-# PYTHON
+##############################
+# 🐍  PYTHON
+##############################
 __pycache__/
 *.py[cod]
 *$py.class
@@ -11,46 +17,67 @@ __pycache__/
 .Python
 build/
 dist/
+eggs/
 .eggs/
 *.egg-info/
 wheels/
+pip-wheel-metadata/
 
-# VIRTUAL ENVS
+##############################
+# 🌱  Virtual Environments
+##############################
 rag_env/
 venv/
 env/
 ENV/
 
-# DATABASE / CACHE
+##############################
+# 📦  Backend Storage / Cache
+##############################
 chroma_db/
 cache/
 .cache/
 *.db
 *.sqlite3
+*.sqlite
 
-# LOGS
-*.log
 exam_prep.log
+*.log
 
-# FRONTEND
-frontend/node_modules/
-frontend/.next/
-
-# MODELS (DO NOT PUSH)
+##############################
+# 🧠  MODELS (Large Files)
+##############################
 models/
 *.bin
 *.gguf
 *.ggml*
 *.pt
+*.safetensors
+*model*
 
-# OS / EDITORS
+##############################
+# 📄  RAG Data (Private PDFs)
+##############################
+data/
+rag_data/
+uploads/
+pdf_uploads/
+
+##############################
+# 🖥️  FRONTEND (Node / Parcel)
+##############################
+frontend/node_modules/
+frontend/.parcel-cache/
+frontend/dist/
+frontend/.next/
+parcel-cache/
+
+##############################
+# 🖥️  OS & Editor Junk
+##############################
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-
-# DATA (REMOVE IF YOU WANT PDFs IN REPO)
-data/
-
-
-frontend/.parcel-cache/
+*.swp
+*.tmp
