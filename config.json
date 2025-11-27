@@ -30,7 +30,7 @@
   "chroma_persist_dir": "./chroma_db",
   "enable_bm25": true,
   "embed_batch_size": 32,
-  "reload_on_start": false,
+  "reload_on_start": true,
   "show_sources_on_answer": true,
 
   "server": {
