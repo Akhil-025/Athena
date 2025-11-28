@@ -4,13 +4,17 @@ import re
 from typing import List, Dict
 from PyPDF2 import PdfReader
 import logging
+from config import get_config
 
 logger = logging.getLogger(__name__)
 
 class PDFProcessor:
-    def __init__(self, chunk_size: int = 800, chunk_overlap: int = 150):
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
+    def __init__(self, chunk_size: int = None, chunk_overlap: int = None):
+        config = get_config()
+        self.chunk_size = chunk_size or config.chunk_size
+        self.chunk_overlap = chunk_overlap or config.chunk_overlap
+
+        logger.info(f"PDFProcessor initialized: chunk_size={self.chunk_size}, overlap={self.chunk_overlap}")
 
     def extract_text_from_pdf(self, file_path: str) -> List[Dict]:
         if not os.path.exists(file_path):
@@ -95,11 +99,16 @@ class PDFProcessor:
         return all_chunks
 
 
-def get_pdf_files_recursive(data_dir: str = "./data") -> List[Dict[str, str]]:
+def get_pdf_files_recursive(data_dir: str = None) -> List[Dict[str, str]]:
+    if data_dir is None:
+        config = get_config()
+        data_dir = str(config.data_dir)
+
     if not os.path.exists(data_dir):
         os.makedirs(data_dir, exist_ok=True)
         logger.warning("Created data directory: %s", data_dir)
         return []
+        
     pdf_files = []
     for root, _, files in os.walk(data_dir):
         for fname in files:

@@ -7,13 +7,16 @@ import re
 from pathlib import Path
 from typing import List, Dict, Optional
 import logging
-
 from main import AthenaApp
 from pdf_processor import get_pdf_files_recursive
+from config import get_config
+from config import paths  
+
 
 logger = logging.getLogger(__name__)
-CONFIG = json.load(open(Path(__file__).parent / "config.json"))
-USE_CLOUD_DEFAULT = CONFIG.get("use_cloud_by_default", False)
+
+config = get_config()
+USE_CLOUD_DEFAULT = config.use_cloud_by_default
 
 
 class UniversalQuestionExtractor:
@@ -220,8 +223,8 @@ class UniversalQuestionExtractor:
 class UniversalAutoSolver:
     """Universal solver for any question paper"""
     
-    def __init__(self, data_dir: str = "./data"):
-        self.data_dir = data_dir
+    def __init__(self, data_dir: str = None):
+        self.data_dir = paths.data_dir
         self.app = AthenaApp(data_dir)
         self.extractor = UniversalQuestionExtractor()
         self.use_cloud = USE_CLOUD_DEFAULT

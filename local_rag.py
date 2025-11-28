@@ -9,8 +9,8 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 
-# Replace these imports with your project's implementations
 from pdf_processor import PDFProcessor, get_pdf_files_recursive, get_organization_structure
+from config import get_config
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -27,15 +27,17 @@ def _safe_get_first(lst):
 class MergedLocalRAG:
     def __init__(
         self,
-        persist_directory: str = "./chroma_db",
-        model_name: str = "all-MiniLM-L6-v2",
-        embed_batch_size: int = 32,
-        enable_bm25: bool = True,
+        persist_directory: str = None,
+        model_name: str = None,
+        embed_batch_size: int = None,
+        enable_bm25: bool = None,
     ):
-        self.persist_directory = persist_directory
-        self.model_name = model_name
-        self.embed_batch_size = max(1, embed_batch_size)
-        self.enable_bm25 = enable_bm25
+        config = get_config()
+
+        self.persist_directory = persist_directory or config.chroma_persist_dir
+        self.model_name = model_name or config.embedding_model
+        self.embed_batch_size = embed_batch_size or config.embed_batch_size
+        self.enable_bm25 = enable_bm25 if enable_bm25 is not None else config.enable_bm25
 
         # Components
         self._initialize_chroma()
@@ -298,9 +300,11 @@ class MergedLocalRAG:
             logger.exception(f"❌ Hybrid search failed: {e}")
             return {'documents': [], 'metadatas': [], 'scores': [], 'query': query, 'total_results': 0}
 
-    def search(self, query: str, n_results: int = 5, subject_filter: Optional[str] = None, module_filter: Optional[str] = None) -> Dict[str, Any]:
+    def search(self, query: str, n_results: int = None, subject_filter: Optional[str] = None, module_filter: Optional[str] = None) -> Dict[str, Any]:
         """Default: use hybrid search if enabled, otherwise semantic only."""
-        if self.enable_bm25:
+        config = get_config()
+        n_results = n_results or config.default_search_results
+        if config.enable_bm25:
             return self.hybrid_search(query, n_results, subject_filter, module_filter)
         # else fallback to semantic-only query
         try:

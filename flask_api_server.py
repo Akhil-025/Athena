@@ -1,6 +1,7 @@
+# flask_api_server.py
+
 import os
 import logging
-import json
 from pathlib import Path
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
@@ -8,23 +9,23 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# logging
-LOGFILE = "athena_api.log"
+from config import get_config, paths  # NEW
+
+# Logging now uses dynamic log directory
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler(LOGFILE, encoding="utf-8")]
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(paths.get_log_file("athena_api"), encoding="utf-8")
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# Load config
-CONFIG_PATH = Path(__file__).parent / "config.json"
-if not CONFIG_PATH.exists():
-    logger.error("config.json not found at %s", CONFIG_PATH)
-    raise SystemExit("Missing config.json")
-CONFIG = json.load(open(CONFIG_PATH))
+# Config instance
+config = get_config()
 
-# Import your metadata + RAG app
+# Import Athena app
 try:
     from main import AthenaApp
 except Exception as e:
@@ -33,9 +34,9 @@ except Exception as e:
 
 # Flask app
 app = Flask(__name__)
-CORS(app)  # enable cross-origin
+CORS(app)
 
-# Instantiate Athena system
+# Initialize Athena system
 SYSTEM = AthenaApp(gemini_api_key=os.getenv("GOOGLE_API_KEY"))
 
 # Initialize RAG at startup
@@ -69,14 +70,14 @@ def ask_question():
         _validate_json_request(["question"], data)
 
         question = data["question"].strip()
-        use_cloud = bool(data.get("use_cloud", CONFIG.get("use_cloud_by_default", False)))
+        use_cloud = bool(data.get("use_cloud", config.use_cloud_by_default))
         subject = data.get("subject")
         module = data.get("module")
 
         logger.info("API /api/ask - len=%d use_cloud=%s subject=%s module=%s",
                     len(question), use_cloud, subject, module)
 
-        # RAG search
+        # Ensure RAG is initialized
         rag = SYSTEM.rag
         if rag is None:
             logger.info("RAG not initialized; initializing now")
@@ -85,7 +86,7 @@ def ask_question():
 
         results = rag.search(
             question,
-            n_results=8,
+            n_results=config.default_search_results,
             subject_filter=subject,
             module_filter=module
         )
@@ -98,16 +99,12 @@ def ask_question():
                 "message": "No relevant information found"
             }), 200
 
-        # Build context prompt
+        # Build context
         context_prompt = SYSTEM.build_context_prompt(question, results)
 
         # Cache logic
         from utils.llm_cache import question_hash, load_cached_answer, save_cached_answer
-
-        context_ids = [
-            m.get("file_name", "") + f":{i}"
-            for i, m in enumerate(results["metadatas"])
-        ]
+        context_ids = [m.get("file_name", "") + f":{i}" for i, m in enumerate(results["metadatas"])]
         qh = question_hash(question, context_ids)
 
         cached = load_cached_answer(qh)
@@ -117,13 +114,13 @@ def ask_question():
                 "answer": cached.get("answer"),
                 "cached": True,
                 "mode": cached.get("mode", "local"),
-                "sources": cached.get("sources", [])  # full objects stored now
+                "sources": cached.get("sources", [])
             }), 200
 
-        # Generate LLM answer
+        # Generate LLM response
         answer = SYSTEM.ai.generate_answer(question, context_prompt, use_cloud=use_cloud)
 
-        # Build YOUR SOURCE OBJECTS for frontend
+        # Prepare source objects
         source_objects = [
             {
                 "file_name": m.get("file_name"),
@@ -135,7 +132,7 @@ def ask_question():
             for doc, m in zip(results["documents"], results["metadatas"])
         ]
 
-        # Save to cache (store full source objects)
+        # Cache full answer
         save_cached_answer(
             qh,
             {
@@ -145,7 +142,6 @@ def ask_question():
             }
         )
 
-        # Return final payload
         return jsonify({
             "answer": answer,
             "cached": False,
@@ -198,11 +194,9 @@ def health_check():
 
 @app.route("/api/reload", methods=["POST"])
 def reload_index():
-    """
-    Re-ingest documents with optional admin key.
-    """
+    """ Re-ingest documents with optional admin key. """
     try:
-        admin_key = CONFIG.get("server", {}).get("api_key_for_admin") or os.getenv("ATHENA_ADMIN_KEY")
+        admin_key = config.api_key_for_admin
 
         if admin_key:
             data = request.get_json(silent=True) or {}
@@ -224,9 +218,5 @@ def reload_index():
 
 
 if __name__ == "__main__":
-    host = CONFIG.get("server", {}).get("host", "127.0.0.1")
-    port = CONFIG.get("server", {}).get("port", 5000)
-    debug = CONFIG.get("server", {}).get("debug", False)
-
-    logger.info("Starting Athena API server on %s:%s", host, port)
-    app.run(host=host, port=port, debug=debug)
+    logger.info("Starting Athena API server on %s:%s", config.server_host, config.server_port)
+    app.run(host=config.server_host, port=config.server_port, debug=config.server_debug)
