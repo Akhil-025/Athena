@@ -1,6 +1,7 @@
 {
   "use_cloud_by_default": false,
   "cloud_provider": "gemini",
+  "cloud_model": "gemini-2.5-flash",
 
   "local_model": {
       "default_engine": "ollama",

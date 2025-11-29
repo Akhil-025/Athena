@@ -1,17 +1,17 @@
-# flask_api_server.py
+# flask_api_server.py 
 
 import os
 import logging
-from pathlib import Path
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 from dotenv import load_dotenv
+from typing import Dict, Any, Tuple
+
+from config import get_config, paths
 
 load_dotenv()
 
-from config import get_config, paths  # NEW
-
-# Logging now uses dynamic log directory
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -22,7 +22,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Config instance
 config = get_config()
 
 # Import Athena app
@@ -36,27 +35,34 @@ except Exception as e:
 app = Flask(__name__)
 CORS(app)
 
-# Initialize Athena system
-SYSTEM = AthenaApp(gemini_api_key=os.getenv("GOOGLE_API_KEY"))
+# Instantiate Athena system - FIXED: Using config.data_dir
+SYSTEM = AthenaApp(
+    data_dir=str(config.data_dir),
+    gemini_api_key=os.getenv("GOOGLE_API_KEY")
+)
 
 # Initialize RAG at startup
 try:
     logger.info("Initializing RAG at server start...")
     SYSTEM.initialize_rag()
     logger.info("RAG initialized successfully")
+    logger.info(f"Query service available: {SYSTEM.query_service is not None}")
 except Exception as e:
     logger.warning("RAG failed at startup: %s", e)
 
 
 def _validate_json_request(required: list, payload: dict):
+    """Validate required fields in JSON request"""
     missing = [k for k in required if k not in payload or payload.get(k) in (None, "")]
     if missing:
         abort(400, description=f"Missing required fields: {', '.join(missing)}")
 
 
 @app.route("/api/ask", methods=["POST"])
-def ask_question():
+def ask_question() -> Tuple[Dict[str, Any], int]:
     """
+    Answer a question using RAG.
+    
     POST body JSON:
     {
       "question": "string",
@@ -77,76 +83,31 @@ def ask_question():
         logger.info("API /api/ask - len=%d use_cloud=%s subject=%s module=%s",
                     len(question), use_cloud, subject, module)
 
-        # Ensure RAG is initialized
-        rag = SYSTEM.rag
-        if rag is None:
-            logger.info("RAG not initialized; initializing now")
+        # FIXED: Ensure RAG and query service are initialized
+        if SYSTEM.rag is None or SYSTEM.query_service is None:
+            logger.info("Query service not initialized; initializing now")
             if not SYSTEM.initialize_rag():
                 return jsonify({"error": "RAG initialization failed"}), 500
 
-        results = rag.search(
-            question,
-            n_results=config.default_search_results,
+        # FIXED: Always use SYSTEM.query_service (no global variable)
+        if not SYSTEM.query_service:
+            return jsonify({"error": "Query service not available"}), 500
+
+        # Execute query using the service
+        result = SYSTEM.query_service.execute_query(
+            question=question,
+            use_cloud=use_cloud,
             subject_filter=subject,
             module_filter=module
         )
 
-        if results.get("total_results", 0) == 0:
-            return jsonify({
-                "answer": None,
-                "cached": False,
-                "sources": [],
-                "message": "No relevant information found"
-            }), 200
-
-        # Build context
-        context_prompt = SYSTEM.build_context_prompt(question, results)
-
-        # Cache logic
-        from utils.llm_cache import question_hash, load_cached_answer, save_cached_answer
-        context_ids = [m.get("file_name", "") + f":{i}" for i, m in enumerate(results["metadatas"])]
-        qh = question_hash(question, context_ids)
-
-        cached = load_cached_answer(qh)
-        if cached:
-            logger.info("Returning cached answer for %s", qh)
-            return jsonify({
-                "answer": cached.get("answer"),
-                "cached": True,
-                "mode": cached.get("mode", "local"),
-                "sources": cached.get("sources", [])
-            }), 200
-
-        # Generate LLM response
-        answer = SYSTEM.ai.generate_answer(question, context_prompt, use_cloud=use_cloud)
-
-        # Prepare source objects
-        source_objects = [
-            {
-                "file_name": m.get("file_name"),
-                "file_path": m.get("file_path"),
-                "page": m.get("page_number"),
-                "text": doc,
-                "score": m.get("score", 0)
-            }
-            for doc, m in zip(results["documents"], results["metadatas"])
-        ]
-
-        # Cache full answer
-        save_cached_answer(
-            qh,
-            {
-                "answer": answer,
-                "sources": source_objects,
-                "mode": "cloud" if use_cloud else "local"
-            }
-        )
-
+        # Return standardized response
         return jsonify({
-            "answer": answer,
-            "cached": False,
-            "mode": "cloud" if use_cloud else "local",
-            "sources": source_objects
+            "answer": result.answer,
+            "cached": result.cached,
+            "mode": result.mode,
+            "sources": [s.to_dict() for s in result.sources],
+            "total_sources": result.total_sources
         }), 200
 
     except Exception as e:
@@ -155,13 +116,13 @@ def ask_question():
 
 
 @app.route("/api/stats", methods=["GET"])
-def get_stats():
+def get_stats() -> Tuple[Dict[str, Any], int]:
+    """Get database statistics"""
     try:
-        rag = SYSTEM.rag
-        if rag is None:
+        if SYSTEM.rag is None:
             return jsonify({"error": "RAG not initialized"}), 500
 
-        stats = rag.get_collection_stats()
+        stats = SYSTEM.rag.get_collection_stats()
         return jsonify({"status": "ok", "stats": stats}), 200
 
     except Exception as e:
@@ -170,22 +131,22 @@ def get_stats():
 
 
 @app.route("/api/health", methods=["GET"])
-def health_check():
+def health_check() -> Tuple[Dict[str, Any], int]:
+    """Health check endpoint"""
     try:
-        rag = SYSTEM.rag
         total_chunks = None
-        if rag:
+        if SYSTEM.rag:
             try:
-                total_chunks = rag.get_collection_stats().get("total_chunks")
+                total_chunks = SYSTEM.rag.get_collection_stats().get("total_chunks")
             except Exception:
                 total_chunks = None
 
         return jsonify({
             "status": "healthy",
-            "local_llm": bool(SYSTEM.ai.local_llm),
-            "cloud_llm": bool(SYSTEM.ai.cloud_llm),
+            "local_llm": SYSTEM.ai.has_local_llm(),
+            "cloud_llm": SYSTEM.ai.has_cloud_llm(),
             "total_chunks": total_chunks,
-            "mode": "local-first"
+            "query_service_available": SYSTEM.query_service is not None
         }), 200
 
     except Exception:
@@ -193,8 +154,10 @@ def health_check():
 
 
 @app.route("/api/reload", methods=["POST"])
-def reload_index():
-    """ Re-ingest documents with optional admin key. """
+def reload_index() -> Tuple[Dict[str, Any], int]:
+    """
+    Re-ingest documents with optional admin key.
+    """
     try:
         admin_key = config.api_key_for_admin
 
@@ -205,7 +168,8 @@ def reload_index():
 
         logger.info("Rebuilding DB via /api/reload")
         SYSTEM.rag.clear_database()
-        SYSTEM.rag.ingest_directory("./data", rebuild_bm25=True)
+        # FIXED: Use config.data_dir instead of hardcoded "./data"
+        SYSTEM.rag.ingest_directory(str(config.data_dir), rebuild_bm25=True)
 
         return jsonify({
             "status": "reloaded",
@@ -218,5 +182,9 @@ def reload_index():
 
 
 if __name__ == "__main__":
-    logger.info("Starting Athena API server on %s:%s", config.server_host, config.server_port)
-    app.run(host=config.server_host, port=config.server_port, debug=config.server_debug)
+    host = config.server_host
+    port = config.server_port
+    debug = config.server_debug
+
+    logger.info("Starting Athena API server on %s:%s", host, port)
+    app.run(host=host, port=port, debug=debug)

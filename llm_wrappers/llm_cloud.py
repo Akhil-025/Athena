@@ -34,9 +34,20 @@ class CloudLLM:
             raise RuntimeError("CloudLLM needs an API key.")
 
         genai.configure(api_key=api_key)
-        self.model = model
+        self.model_name = model
         self.max_output_tokens = max_output_tokens
         self.retries = retries
+        
+        # Initialize the GenerativeModel instance
+        self.model = genai.GenerativeModel(
+            model_name=model,
+            generation_config={
+                "max_output_tokens": max_output_tokens,
+                "temperature": 0.15
+            }
+        )
+        
+        logger.info(f"CloudLLM initialized: {model}")
 
     # -----------------------------------------------------------
     # Extract text from ANY Gemini SDK response (all versions)
@@ -45,30 +56,47 @@ class CloudLLM:
         if r is None:
             return ""
 
-        # v0.3 onwards
+        # v0.3+ (current SDK version)
         if hasattr(r, "text"):
-            return r.text or ""
+            try:
+                return r.text or ""
+            except Exception:
+                pass
 
-        if hasattr(r, "output_text"):
-            return r.output_text or ""
+        # Try parts
+        if hasattr(r, "parts"):
+            try:
+                return ''.join(part.text for part in r.parts if hasattr(part, 'text'))
+            except Exception:
+                pass
+        
+        # Try candidates
+        if hasattr(r, "candidates"):
+            try:
+                if r.candidates and len(r.candidates) > 0:
+                    candidate = r.candidates[0]
+                    if hasattr(candidate, "content"):
+                        content = candidate.content
+                        if hasattr(content, "parts"):
+                            return ''.join(part.text for part in content.parts if hasattr(part, 'text'))
+            except Exception:
+                pass
 
-        # Dict-like
+        # Dict-like fallback
         if isinstance(r, dict):
-
+            if "text" in r:
+                return r["text"]
             if "output_text" in r:
                 return r["output_text"]
-
             if "candidates" in r:
                 cands = r["candidates"]
                 if cands and isinstance(cands, list):
                     c0 = cands[0]
-                    for k in ("content", "text", "output_text"):
-                        if isinstance(c0, dict) and k in c0:
-                            return c0[k] or ""
-                    return str(c0)
-
-            if "content" in r:
-                return r["content"]
+                    if isinstance(c0, dict):
+                        if "content" in c0:
+                            return str(c0["content"])
+                        if "text" in c0:
+                            return c0["text"]
 
         # Last fallback
         return str(r)
@@ -77,6 +105,16 @@ class CloudLLM:
     # Generate response
     # -----------------------------------------------------------
     def generate(self, prompt: str, timeout: int = 60) -> Dict[str, Any]:
+        """
+        Generate a response using Gemini API.
+        
+        Args:
+            prompt: The prompt text
+            timeout: Timeout in seconds (not strictly enforced by SDK)
+            
+        Returns:
+            Dict with keys: text, error, meta
+        """
         if genai is None:
             return {"text": "", "error": "Gemini SDK missing", "meta": {}}
 
@@ -85,38 +123,33 @@ class CloudLLM:
 
         for attempt in range(1, self.retries + 1):
             try:
-                if hasattr(genai.models, "generate"):
-                    res = genai.models.generate(
-                        model=self.model,
-                        prompt=prompt,
-                        max_output_tokens=self.max_output_tokens,
-                        timeout=timeout
-                    )
-                else:
-                    # legacy fallback
-                    res = genai.generate_text(
-                        model=self.model,
-                        prompt=prompt,
-                        max_output_tokens=self.max_output_tokens
-                    )
-
-                text = self._extract_text(res)
+                # Use the correct SDK method
+                response = self.model.generate_content(prompt)
+                
+                # Extract text from response
+                text = self._extract_text(response)
+                
                 return {
                     "text": text,
                     "error": None,
                     "meta": {
                         "duration": time.time() - start,
-                        "attempt": attempt
+                        "attempt": attempt,
+                        "model": self.model_name
                     }
                 }
 
             except Exception as e:
                 last_err = str(e)
                 logger.warning(f"CloudLLM attempt {attempt} failed: {e}")
-                time.sleep(min(2 ** attempt, 8))
+                
+                if attempt < self.retries:
+                    wait_time = min(2 ** attempt, 8)
+                    time.sleep(wait_time)
                 continue
 
         # All retries failed
+        logger.error(f"CloudLLM failed after {self.retries} attempts: {last_err}")
         return {
             "text": "",
             "error": last_err,

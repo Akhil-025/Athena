@@ -1,136 +1,135 @@
 # main.py 
+
 import os
 import sys
 import logging
+from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
 
-from config import get_config, paths   
+from config import get_config, paths
 from local_rag import MergedLocalRAG
-from pdf_processor import get_pdf_files_recursive, get_organization_structure
-from utils.sanitize import prepare_context_for_cloud
-from utils.llm_cache import question_hash, load_cached_answer, save_cached_answer
-from llm_wrappers.llm_local import LocalLLM
-from llm_wrappers.llm_cloud import CloudLLM
-
-try:
-    from llm_wrappers.llm_ollama import OllamaLLM
-except Exception:
-    OllamaLLM = None
+from pdf_processor import get_pdf_files_recursive
+from models import SourceDocument
+from services import QueryService
+from factories import LLMFactory
+from handlers import CommandHandler
 
 load_dotenv()
 
-# Configure logging once
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stdout), 
+        logging.StreamHandler(sys.stdout),
         logging.FileHandler(paths.get_log_file("athena_prep"), encoding="utf-8")
     ]
 )
 logger = logging.getLogger(__name__)
 
-config = get_config() 
+config = get_config()
 
 
 class AIIntegration:
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
-        engine = config.local_model_engine.lower()
-        self.local_llm = None
-        self.cloud_llm = None
-
-        # Local LLM selection
-        if engine == "ollama":
-            if OllamaLLM is None:
-                logger.warning("Ollama wrapper not found (llm_wrappers/llm_ollama.py).")
-            else:
-                try:
-                    self.local_llm = OllamaLLM(model=config.ollama_model)
-                    logger.info("Initialized Ollama local LLM.")
-                except Exception as e:
-                    logger.warning("Ollama initialization failed: %s", e)
-                    self.local_llm = None
-
-        elif engine == "llama-cpp":
-            try:
-                self.local_llm = LocalLLM(
-                    model_path=config.local_model_path,
-                    max_tokens=config.max_tokens,
-                    n_ctx=config.n_ctx,
-                    temperature=config.temperature,
-                )
-                logger.info("Initialized llama-cpp local LLM.")
-            except Exception as e:
-                logger.warning("llama-cpp init failed: %s", e)
-                self.local_llm = None
-        else:
-            logger.info("⚠️ No valid local LLM configured.")
-
-        # Cloud LLM setup
-        if self.api_key:
-            try:
-                self.cloud_llm = CloudLLM(
-                    api_key=self.api_key,
-                    model=config.cloud_model,
-                    max_output_tokens=config.max_tokens
-                )
-                logger.info("Cloud LLM initialized.")
-            except Exception as e:
-                logger.warning("Cloud LLM init failed: %s", e)
-                self.cloud_llm = None
-        else:
-            logger.warning("GOOGLE_API_KEY not set; cloud LLM disabled.")
-
-
-    def generate_answer(self, question: str, context: str, use_cloud: bool = False) -> str:
-        """Return LLM response text; prefer cloud if requested and available."""
-
+    """
+    AI Integration - Manages LLM providers and answer generation.
+    Uses Factory Pattern for LLM initialization.
+    """
+    
+    def __init__(self, api_key: Optional[str] = None):
+        """
+        Initialize AI integration with LLM providers.
+        
+        Args:
+            api_key: Optional API key for cloud LLM
+        """
+        self.config = get_config()
+        
+        # Use factory to create LLMs
+        self.local_llm, self.cloud_llm = LLMFactory.create_llms(api_key)
+    
+    def generate_answer(
+        self,
+        question: str,
+        sources: list[SourceDocument],
+        use_cloud: bool = False
+    ) -> str:
+        """
+        Generate answer using appropriate LLM.
+        
+        Args:
+            question: The user's question
+            sources: List of SourceDocument objects with context
+            use_cloud: Whether to use cloud LLM
+            
+        Returns:
+            Generated answer text
+        """
+        from services import PromptBuilder
+        
+        # Select LLM
         if use_cloud and self.cloud_llm:
+            llm = self.cloud_llm
             logger.info("Using cloud LLM")
-            safe_chunks = [{"text": context[:2000], "source": "user_documents"}]
-
-            safe_ctx = prepare_context_for_cloud(
-                safe_chunks,
-                max_chunks=config.max_chunks_cloud,
-                max_chars=config.max_chunk_chars_cloud
-            )
-
-            ctx_text = "\n\n".join([f"Source {i+1} ({c['source']}):\n{c['text']}" 
-                                    for i, c in enumerate(safe_ctx)])
-
-            prompt = (
-                f"You are Athena — an expert AI study partner.\n"
-                f"Use ONLY the provided context.\n\n"
-                f"CONTEXT:\n{ctx_text}\n\n"
-                f"QUESTION: {question}\n\nANSWER:"
-            )
-
-            res = self.cloud_llm.generate(prompt, timeout=config.llm_timeout)
-            return res.get("text", str(res))
-
-        if self.local_llm:
+        elif self.local_llm:
+            llm = self.local_llm
             logger.info("Using local LLM")
-            prompt = (
-                f"You are an expert engineering tutor.\n"
-                f"Use the context to answer.\n\n"
-                f"CONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"
+        else:
+            return "❌ No LLM available. Enable local or cloud LLM."
+        
+        # Build prompt using PromptBuilder service
+        prompt = PromptBuilder.build_prompt(
+            question=question,
+            sources=sources,
+            use_cloud=use_cloud
+        )
+        
+        # Generate response
+        try:
+            result = llm.generate(
+                prompt=prompt,
+                timeout=self.config.llm_timeout_seconds
             )
-            res = self.local_llm.generate(prompt, timeout=config.llm_timeout)
-            return res.get("text", str(res))
-
-        return "❌ No LLM available. Enable local or cloud LLM."
+            
+            # Extract text from response
+            if isinstance(result, dict):
+                return result.get("text", str(result))
+            else:
+                return str(result)
+                
+        except Exception as e:
+            logger.exception(f"LLM generation failed: {e}")
+            return f"❌ Error generating answer: {str(e)}"
+    
+    def has_local_llm(self) -> bool:
+        """Check if local LLM is available"""
+        return self.local_llm is not None
+    
+    def has_cloud_llm(self) -> bool:
+        """Check if cloud LLM is available"""
+        return self.cloud_llm is not None
 
 
 class AthenaApp:
-    def __init__(self, data_dir: str = "./data", gemini_api_key: str = None):
+    """Main application class for Athena RAG system"""
+    
+    def __init__(self, data_dir: str = "./data", gemini_api_key: Optional[str] = None):
+        """
+        Initialize Athena application.
+        
+        Args:
+            data_dir: Directory containing PDF documents
+            gemini_api_key: Optional API key for Gemini
+        """
         self.data_dir = data_dir
         self.rag = None
         self.ai = AIIntegration(gemini_api_key)
+        self.query_service = None
         self.setup_data_directory()
 
-    def setup_data_directory(self):
+    def setup_data_directory(self) -> bool:
+        """Create data directory if it doesn't exist"""
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir, exist_ok=True)
             logger.info("Created data directory: %s", self.data_dir)
@@ -138,7 +137,12 @@ class AthenaApp:
         return True
 
     def _create_sample_structure(self):
-        sample_structure = config.sample_structure
+        """Create sample folder structure"""
+        sample_structure = {
+            "CAD_CAM": ["2D_Transformations", "CNC_Programming", "CAD_Algorithms"],
+            "Machine_Design": ["Shafts", "Bearings", "Gears"],
+            "Thermodynamics": ["Heat_Transfer", "Cycles"]
+        }
         for subject, modules in sample_structure.items():
             for module in modules:
                 os.makedirs(os.path.join(self.data_dir, subject, module), exist_ok=True)
@@ -146,15 +150,24 @@ class AthenaApp:
         logger.info("Sample folder structure created under %s", self.data_dir)
         print("📂 Sample folders created. Add PDFs and re-run.")
 
-    def initialize_rag(self):
+    def initialize_rag(self) -> bool:
+        """
+        Initialize RAG system with vector database and query service.
+        
+        Returns:
+            True if initialization successful
+        """
         logger.info("Initializing RAG...")
-
+        
         self.rag = MergedLocalRAG(
             persist_directory=config.chroma_persist_dir,
             model_name=config.embedding_model,
             embed_batch_size=config.embed_batch_size,
             enable_bm25=config.enable_bm25
         )
+
+        # Initialize query service
+        self.query_service = QueryService(self.rag, self.ai)
 
         stats = self.rag.get_collection_stats()
 
@@ -166,117 +179,47 @@ class AthenaApp:
 
         return True
 
-    def auto_answer_question(self, question: str, subject_filter: str = None, module_filter: str = None, use_cloud: bool = False) -> str:
-        results = self.rag.search(question, subject_filter=subject_filter, module_filter=module_filter)
-
-        if results.get("total_results", 0) == 0:
-            return "❌ No relevant information found."
-
-        context = self.build_context_prompt(question, results)
-
-        # Caching
-        context_ids = [m.get("file_name", "") + f":{i}" for i, m in enumerate(results["metadatas"])]
-        qh = question_hash(question, context_ids)
-
-        cached = load_cached_answer(qh)
-        if cached:
-            logger.info("Using cached answer")
-            return cached.get("answer")
-
-        answer = self.ai.generate_answer(question, context, use_cloud=use_cloud)
-        save_cached_answer(qh, {
-            "answer": answer,
-            "sources": [m.get("file_name", "unknown") for m in results["metadatas"]]
-        })
-
-        return answer
-
-
-    def build_context_prompt(self, question: str, results: dict) -> str:
-        if results.get("total_results", 0) == 0:
-            return f"Question: {question}\n\nNo relevant context found."
-
-        ctx = []
-        for i, (doc, md) in enumerate(zip(results["documents"], results["metadatas"]), 1):
-            header = (
-                f"--- Excerpt {i}: {md.get('file_name','unknown')} | {md.get('subject','?')} "
-                f"→ {md.get('module','?')} (Page {md.get('page_number','?')}) ---"
-            )
-            ctx.append(f"{header}\n{doc}")
-
-        return (
-            "Answer based on the excerpts below.\n\n"
-            + "\n\n".join(ctx)
-            + f"\n\nQUESTION: {question}\nANSWER:"
-        )
-
-
-    def format_search_results(self, results: dict) -> str:
-        if results.get("total_results", 0) == 0:
-            return "❌ No results found."
-
-        lines = [f"🔍 Found {results['total_results']} relevant sections:"]
-        docs = results.get("documents", [])
-        mds = results.get("metadatas", [])
-
-        for i, (d, md) in enumerate(zip(docs, mds), 1):
-            snippet = d[:200].replace("\n", " ")
-            lines.append(
-                f"{i}. {md.get('subject','Unknown')} → {md.get('module','General')} | "
-                f"{md.get('file_name','unknown')} (Page {md.get('page_number','?')})\n   {snippet}..."
-            )
-
-        return "\n\n".join(lines)
-
-
     def interactive_session(self):
+        """
+        Interactive Q&A session.
+        Uses CommandHandler to process all user input - FIXED VERSION!
+        """
         if not self.rag:
             self.initialize_rag()
-
+        
         print("\n🧠 ATHENA — Interactive mode (type 'quit' to exit)\n")
-
-        current_filters = {"subject": None, "module": None}
-        use_cloud = config.use_cloud_default
-
+        
+        # Create command handler - delegates ALL command logic
+        handler = CommandHandler(self.query_service, self.rag)
+        
+        # Main loop - just input → handle → display
         while True:
             try:
-                mode_display = "☁️ CLOUD" if use_cloud else "💻 LOCAL"
-                inp = input(f"\n❓ [{mode_display}] Ask: ").strip()
-
-                if inp.lower() in ("quit", "exit", "q"):
+                # Get user input
+                user_input = input(handler.get_prompt())
+                
+                # Process command using handler
+                result = handler.handle_command(user_input)
+                
+                # Display result message if any
+                if result.message:
+                    print(result.message)
+                
+                # Check if should continue
+                if not result.continue_loop:
                     break
-
-                if inp == "":
-                    continue
-
-                results = self.rag.search(inp, subject_filter=current_filters["subject"], module_filter=current_filters["module"])
-                if results.get("total_results", 0) == 0:
-                    print("❌ No relevant sections found.")
-                    continue
-
-                context = self.build_context_prompt(inp, results)
-                answer = self.ai.generate_answer(inp, context, use_cloud=use_cloud)
-
-                print("\n" + "=" * 60)
-                print("ANSWER:\n")
-                print(answer)
-
-                if config.show_sources:
-                    print("\nSOURCES:\n")
-                    print(self.format_search_results(results))
-
-                print("=" * 60)
-
+                    
             except KeyboardInterrupt:
-                print("\nInterrupted. Goodbye.")
+                print("\n\n👋 Interrupted. Goodbye!")
                 break
-
             except Exception as e:
-                logger.exception("Error during interactive loop: %s", e)
-                print("⚠️ Error:", e)
+                logger.exception(f"Unexpected error: {e}")
+                print(f"\n❌ Unexpected error: {e}")
+                print("Type 'quit' to exit or continue asking questions.")
 
 
 def main():
+    """Main entry point"""
     gemini_key = os.getenv("GOOGLE_API_KEY")
     app = AthenaApp(gemini_api_key=gemini_key)
 
