@@ -1,17 +1,16 @@
-# auto_solver.py
+# auto_solver.py - REFACTORED: Function decomposition applied
 
 import os
 import time
 import json
 import re
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import logging
 from main import AthenaApp
 from pdf_processor import get_pdf_files_recursive
 from config import get_config
 from config import paths  
-
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +52,8 @@ class UniversalQuestionExtractor:
         'management': ['strategy', 'organization', 'leadership', 'planning', 'control'],
     }
     
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize question extractor with compiled regex patterns."""
         self.compiled_patterns = [re.compile(p, re.MULTILINE | re.IGNORECASE | re.DOTALL) 
                                   for p in self.QUESTION_PATTERNS]
     
@@ -223,14 +223,25 @@ class UniversalQuestionExtractor:
 class UniversalAutoSolver:
     """Universal solver for any question paper"""
     
-    def __init__(self, data_dir: str = None):
-        self.data_dir = paths.data_dir
-        self.app = AthenaApp(data_dir)
-        self.extractor = UniversalQuestionExtractor()
-        self.use_cloud = USE_CLOUD_DEFAULT
+    def __init__(self, data_dir: Optional[str] = None) -> None:
+        """
+        Initialize the auto solver.
         
-    def set_cloud_mode(self, use_cloud: bool):
-        """Toggle between local and cloud LLM"""
+        Args:
+            data_dir: Optional data directory path
+        """
+        self.data_dir: str = data_dir or config.data_dir
+        self.app: AthenaApp = AthenaApp(self.data_dir)
+        self.extractor: UniversalQuestionExtractor = UniversalQuestionExtractor()
+        self.use_cloud: bool = USE_CLOUD_DEFAULT
+        
+    def set_cloud_mode(self, use_cloud: bool) -> None:
+        """
+        Toggle between local and cloud LLM.
+        
+        Args:
+            use_cloud: Whether to use cloud LLM
+        """
         self.use_cloud = use_cloud
         mode = "CLOUD ☁️" if use_cloud else "LOCAL 💻"
         print(f"Solver mode: {mode}")
@@ -277,7 +288,7 @@ class UniversalAutoSolver:
         
         return analysis
     
-    def _extract_metadata(self, filename: str, text: str) -> Dict:
+    def _extract_metadata(self, filename: str, text: str) -> Dict[str, str]:
         """Extract metadata like year, semester, course from filename and content"""
         metadata = {}
         
@@ -299,22 +310,76 @@ class UniversalAutoSolver:
         
         return metadata
     
-    def solve_question_paper(self, pdf_path: str, output_file: Optional[str] = None,
-                           subject_filter: Optional[str] = None,
-                           module_filter: Optional[str] = None):
-        """Solve all questions in a question paper"""
+    # REFACTORED: Main solve_question_paper now orchestrates smaller methods
+    def solve_question_paper(
+        self,
+        pdf_path: str,
+        output_file: Optional[str] = None,
+        subject_filter: Optional[str] = None,
+        module_filter: Optional[str] = None
+    ) -> None:
+        """
+        Solve all questions in a question paper.
+        REFACTORED: Now a high-level orchestrator calling smaller methods.
+        
+        Args:
+            pdf_path: Path to PDF file
+            output_file: Optional output file path
+            subject_filter: Optional subject filter
+            module_filter: Optional module filter
+        """
         print("\n" + "="*80)
         print("🎯 UNIVERSAL QUESTION PAPER SOLVER")
         print("="*80)
         
-        # Analyze the paper
+        # Step 1: Analyze the paper
         analysis = self.analyze_question_paper(pdf_path)
         
         if 'error' in analysis:
             print(f"❌ Error: {analysis['error']}")
             return
         
-        # Display analysis
+        # Step 2: Display analysis summary
+        self._display_analysis_summary(analysis)
+        
+        questions = analysis['questions']
+        
+        if not questions:
+            self._display_no_questions_warning()
+            return
+        
+        # Step 3: Get user confirmation
+        if not self._confirm_solving(questions):
+            return
+        
+        # Step 4: Prepare output file
+        output_file = self._prepare_output_file(analysis, output_file)
+        
+        # Step 5: Initialize RAG
+        if not self._ensure_rag_initialized():
+            return
+        
+        # Step 6: Write header
+        self._write_header(output_file, analysis)
+        
+        # Step 7: Solve questions
+        print(f"\n🚀 Starting to solve questions...")
+        print(f"   Mode: {'☁️  CLOUD' if self.use_cloud else '💻 LOCAL'}")
+        print(f"   Output: {output_file}\n")
+        
+        solved, failed = self._solve_questions_loop(
+            questions=questions,
+            output_file=output_file,
+            subject_filter=subject_filter or analysis.get('detected_subject'),
+            module_filter=module_filter
+        )
+        
+        # Step 8: Display summary
+        self._display_solving_summary(solved, failed, output_file)
+    
+    # EXTRACTED METHOD: Display analysis summary
+    def _display_analysis_summary(self, analysis: Dict) -> None:
+        """Display analysis summary to user."""
         print(f"\n📊 Analysis:")
         print(f"   • File: {analysis['filename']}")
         print(f"   • Pages: {analysis['total_pages']}")
@@ -323,40 +388,84 @@ class UniversalAutoSolver:
         
         if analysis['metadata']:
             print(f"   • Metadata: {analysis['metadata']}")
+    
+    # EXTRACTED METHOD: Display no questions warning
+    def _display_no_questions_warning(self) -> None:
+        """Display warning when no questions are found."""
+        print("\n⚠️  No questions found in the PDF.")
+        print("   The PDF might be:")
+        print("   - Image-based (needs OCR)")
+        print("   - Using an unusual format")
+        print("   - Not actually a question paper")
+    
+    # EXTRACTED METHOD: Get user confirmation
+    def _confirm_solving(self, questions: List[Dict]) -> bool:
+        """
+        Get user confirmation before solving.
         
-        questions = analysis['questions']
-        
-        if not questions:
-            print("\n⚠️  No questions found in the PDF.")
-            print("   The PDF might be:")
-            print("   - Image-based (needs OCR)")
-            print("   - Using an unusual format")
-            print("   - Not actually a question paper")
-            return
-        
-        # Confirm before solving
+        Args:
+            questions: List of extracted questions
+            
+        Returns:
+            True if user confirms, False otherwise
+        """
         proceed = input(f"\n❓ Proceed to solve {len(questions)} questions? (y/n): ").strip().lower()
         if proceed != 'y':
             print("Cancelled.")
-            return
+            return False
+        return True
+    
+    # EXTRACTED METHOD: Prepare output file
+    def _prepare_output_file(self, analysis: Dict, output_file: Optional[str]) -> str:
+        """
+        Prepare output file path.
         
-        # Setup output file
+        Args:
+            analysis: Paper analysis dict
+            output_file: Optional output file path
+            
+        Returns:
+            Output file path
+        """
         if not output_file:
             base_name = os.path.splitext(analysis['filename'])[0]
             output_file = f"{base_name}_solutions.txt"
+        return output_file
+    
+    # EXTRACTED METHOD: Ensure RAG initialized
+    def _ensure_rag_initialized(self) -> bool:
+        """
+        Ensure RAG system is initialized.
         
-        # Initialize RAG
+        Returns:
+            True if initialized successfully, False otherwise
+        """
         if not self.app.initialize_rag():
             print("❌ Failed to initialize RAG")
-            return
+            return False
+        return True
+    
+    # EXTRACTED METHOD: Question solving loop
+    def _solve_questions_loop(
+        self,
+        questions: List[Dict],
+        output_file: str,
+        subject_filter: Optional[str],
+        module_filter: Optional[str]
+    ) -> Tuple[int, int]:
+        """
+        Loop through questions and solve them.
+        EXTRACTED from solve_question_paper for better testability.
         
-        # Solve questions
-        print(f"\n🚀 Starting to solve questions...")
-        print(f"   Mode: {'☁️  CLOUD' if self.use_cloud else '💻 LOCAL'}")
-        print(f"   Output: {output_file}\n")
-        
-        self._write_header(output_file, analysis)
-        
+        Args:
+            questions: List of question dictionaries
+            output_file: Path to output file
+            subject_filter: Optional subject filter
+            module_filter: Optional module filter
+            
+        Returns:
+            Tuple of (solved_count, failed_count)
+        """
         solved = 0
         failed = 0
         
@@ -369,7 +478,7 @@ class UniversalAutoSolver:
                 # Get answer
                 answer = self.app.auto_answer_question(
                     question,
-                    subject_filter=subject_filter or analysis.get('detected_subject'),
+                    subject_filter=subject_filter,
                     module_filter=module_filter,
                     use_cloud=self.use_cloud
                 )
@@ -389,7 +498,23 @@ class UniversalAutoSolver:
                 print(f"❌ Failed: {str(e)}")
                 failed += 1
         
-        # Summary
+        return solved, failed
+    
+    # EXTRACTED METHOD: Display solving summary
+    def _display_solving_summary(
+        self,
+        solved: int,
+        failed: int,
+        output_file: str
+    ) -> None:
+        """
+        Display final summary after solving.
+        
+        Args:
+            solved: Number of successfully solved questions
+            failed: Number of failed questions
+            output_file: Path to output file
+        """
         print("\n" + "="*80)
         print("📊 SUMMARY")
         print("="*80)
@@ -398,7 +523,7 @@ class UniversalAutoSolver:
         print(f"   📄 Output: {output_file}")
         print("="*80 + "\n")
     
-    def _write_header(self, output_file: str, analysis: Dict):
+    def _write_header(self, output_file: str, analysis: Dict) -> None:
         """Write header section to output file"""
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write("="*80 + "\n")
@@ -416,8 +541,14 @@ class UniversalAutoSolver:
             f.write(f"Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("\n" + "="*80 + "\n\n")
     
-    def _save_answer(self, output_file: str, q_num: int, question: str, 
-                    answer: str, q_data: Dict):
+    def _save_answer(
+        self,
+        output_file: str,
+        q_num: int,
+        question: str,
+        answer: str,
+        q_data: Dict
+    ) -> None:
         """Save individual answer to file"""
         with open(output_file, 'a', encoding='utf-8') as f:
             f.write("\n" + "="*80 + "\n")
@@ -435,7 +566,7 @@ class UniversalAutoSolver:
             f.write(f"{answer}\n")
             f.write("="*80 + "\n")
     
-    def batch_solve_directory(self, directory: str = None):
+    def batch_solve_directory(self, directory: Optional[str] = None) -> None:
         """Solve all question papers in a directory"""
         if directory is None:
             directory = input("Enter directory path containing question papers: ").strip()
@@ -481,7 +612,8 @@ class UniversalAutoSolver:
                 time.sleep(2)  # Brief pause between papers
 
 
-def main():
+def main() -> None:
+    """Main entry point for the auto solver."""
     print("\n" + "="*80)
     print("🎓 ATHENA UNIVERSAL QUESTION PAPER AUTO-SOLVER")
     print("="*80)

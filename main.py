@@ -1,4 +1,4 @@
-# main.py 
+# main.py - FIXED: Proper exception handling
 
 import os
 import sys
@@ -14,6 +14,7 @@ from models import SourceDocument
 from services import QueryService
 from factories import LLMFactory
 from handlers import CommandHandler
+from exceptions import LLMError, QueryError  # ADDED
 
 load_dotenv()
 
@@ -65,10 +66,13 @@ class AIIntegration:
             
         Returns:
             Generated answer text
+            
+        Raises:
+            LLMError: If no LLM is available or generation fails
         """
         from services import PromptBuilder
         
-        # Select LLM
+        # Select LLM - FIXED: Raise exception instead of returning error string
         if use_cloud and self.cloud_llm:
             llm = self.cloud_llm
             logger.info("Using cloud LLM")
@@ -76,7 +80,8 @@ class AIIntegration:
             llm = self.local_llm
             logger.info("Using local LLM")
         else:
-            return "❌ No LLM available. Enable local or cloud LLM."
+            # FIXED: Raise exception instead of returning error string
+            raise LLMError("No LLM available. Enable local or cloud LLM.")
         
         # Build prompt using PromptBuilder service
         prompt = PromptBuilder.build_prompt(
@@ -85,7 +90,7 @@ class AIIntegration:
             use_cloud=use_cloud
         )
         
-        # Generate response
+        # Generate response - FIXED: Proper exception handling
         try:
             result = llm.generate(
                 prompt=prompt,
@@ -94,13 +99,21 @@ class AIIntegration:
             
             # Extract text from response
             if isinstance(result, dict):
-                return result.get("text", str(result))
+                text = result.get("text", "")
+                if result.get("error"):
+                    # FIXED: Raise exception with error details
+                    raise LLMError(f"LLM generation failed: {result['error']}")
+                return text or str(result)
             else:
                 return str(result)
                 
+        except LLMError:
+            # Re-raise LLM errors
+            raise
         except Exception as e:
+            # FIXED: Wrap unexpected errors in LLMError with context
             logger.exception(f"LLM generation failed: {e}")
-            return f"❌ Error generating answer: {str(e)}"
+            raise LLMError(f"LLM generation failed: {e}") from e
     
     def has_local_llm(self) -> bool:
         """Check if local LLM is available"""
@@ -182,7 +195,7 @@ class AthenaApp:
     def interactive_session(self):
         """
         Interactive Q&A session.
-        Uses CommandHandler to process all user input - FIXED VERSION!
+        Uses CommandHandler to process all user input.
         """
         if not self.rag:
             self.initialize_rag()
