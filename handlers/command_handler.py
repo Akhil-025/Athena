@@ -1,261 +1,249 @@
 """
 Command Handler - Processes user commands in interactive session.
 Separates command logic from the main interactive loop.
-FIXED: Added comprehensive type hints
 """
-import logging
-from typing import Optional, Dict, Any, TYPE_CHECKING
-from services import ContextAssembler, QueryService
-from config import get_config
-from exceptions import QueryError, LLMError, RAGError
 
-# ADDED: Import protocols for type checking
+import logging
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, Callable, TYPE_CHECKING
+from config import get_config, ConfigManager
+from exceptions import QueryError, LLMError, RAGError
+from models import QueryResult
+from services import ContextAssembler, QueryService
+
 if TYPE_CHECKING:
     from protocols import RAGProtocol
 
 logger = logging.getLogger(__name__)
 
 
-class CommandResult:
-    """Result of a command execution"""
-    
-    def __init__(self, continue_loop: bool = True, message: Optional[str] = None) -> None:
-        """
-        Initialize command result.
-        
-        Args:
-            continue_loop: Whether to continue the interactive loop
-            message: Optional message to display to user
-        """
-        self.continue_loop: bool = continue_loop
-        self.message: Optional[str] = message
+# ---------------------------------------------------------------------------
+# Result wrapper
+# ---------------------------------------------------------------------------
 
+@dataclass
+class CommandResult:
+    """Result of a command execution."""
+
+    continue_loop: bool = True
+    message: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Handler
+# ---------------------------------------------------------------------------
 
 class CommandHandler:
-    """Handles interactive session commands"""
-    
-    def __init__(self, query_service: QueryService, rag: 'RAGProtocol') -> None:
-        """
-        Initialize command handler.
-        
-        Args:
-            query_service: QueryService instance for executing queries
-            rag: RAG instance implementing RAGProtocol
-        """
+    """Handles interactive session commands."""
+
+    # Commands that map directly to a handler (no argument parsing needed).
+    # Populated in __init__ so each instance binds to its own methods.
+    _simple_commands: Dict[str, Callable[[], CommandResult]]
+
+    def __init__(self, query_service: QueryService, rag: "RAGProtocol") -> None:
         self.query_service: QueryService = query_service
-        self.rag: RAGProtocol = rag
-        self.config = get_config()
+        self.rag: "RAGProtocol" = rag
+        self.config: ConfigManager = get_config()
         self.filters: Dict[str, Optional[str]] = {"subject": None, "module": None}
         self.use_cloud: bool = self.config.use_cloud_by_default
-    
+
+        # ---- dispatch table for zero-arg commands ----
+        self._simple_commands = {
+            "stats":          self._handle_stats,
+            "local":          lambda: self._handle_mode_switch(use_cloud=False),
+            "cloud":          lambda: self._handle_mode_switch(use_cloud=True),
+            "help":           self._handle_help,
+            "filter clear":   self._handle_filter_clear,
+            "clear filter":   self._handle_filter_clear,
+            "clear filters":  self._handle_filter_clear,
+            "status":         self._handle_status,
+        }
+
+        # ---- dispatch table for prefix commands (need the raw input) ----
+        self._prefix_commands: Dict[str, Callable[[str], CommandResult]] = {
+            "filter subject:": lambda raw: self._handle_filter("subject", raw),
+            "filter module:":  lambda raw: self._handle_filter("module", raw),
+        }
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def handle_command(self, user_input: str) -> CommandResult:
-        """
-        Process user input and return result.
-        
-        Args:
-            user_input: Raw user input string
-            
-        Returns:
-            CommandResult with continue flag and optional message
-        """
-        inp: str = user_input.strip().lower()
-        
-        # Exit commands
-        if inp in ("quit", "exit", "q"):
+        """Process user input and return a result."""
+        stripped: str = user_input.strip()
+        lowered: str = stripped.lower()
+
+        # Exit
+        if lowered in ("quit", "exit", "q"):
             return CommandResult(continue_loop=False, message="Goodbye! 👋")
-        
-        # Empty input
-        if not inp:
-            return CommandResult(continue_loop=True)
-        
-        # Command routing
-        if inp == "stats":
-            return self._handle_stats()
-        elif inp == "local":
-            return self._handle_mode_switch(use_cloud=False)
-        elif inp == "cloud":
-            return self._handle_mode_switch(use_cloud=True)
-        elif inp.startswith("filter subject:"):
-            return self._handle_subject_filter(user_input)
-        elif inp.startswith("filter module:"):
-            return self._handle_module_filter(user_input)
-        elif inp == "help":
-            return self._handle_help()
-        elif inp in ("filter clear", "clear filter", "clear filters"):
-            return self._handle_filter_clear()
-        else:
-            # It's a question
-            return self._handle_question(user_input.strip())
-    
+
+        # Empty
+        if not lowered:
+            return CommandResult()
+
+        # Simple (exact-match) commands
+        if lowered in self._simple_commands:
+            return self._simple_commands[lowered]()
+
+        # Prefix commands
+        for prefix, handler in self._prefix_commands.items():
+            if lowered.startswith(prefix):
+                return handler(stripped)
+
+        # Anything else is a question
+        return self._handle_question(stripped)
+
+    def get_prompt(self) -> str:
+        """Return the formatted input prompt string."""
+        mode: str = "☁️  CLOUD" if self.use_cloud else "💻 LOCAL"
+        parts: list[str] = [mode]
+
+        active = self._active_filter_parts()
+        if active:
+            parts.append(" | ".join(active))
+
+        return f"\n❓ [{' · '.join(parts)}] Ask: "
+
+    # ------------------------------------------------------------------
+    # Command handlers
+    # ------------------------------------------------------------------
+
     def _handle_stats(self) -> CommandResult:
-        """
-        Show database statistics.
-        
-        Returns:
-            CommandResult with stats message
-        """
         stats: Dict[str, Any] = self.rag.get_collection_stats()
-        
-        subjects: list = stats.get('subjects', [])
-        subject_list: str = ', '.join(subjects) if subjects else 'None'
-        
-        message: str = (
+        subjects: list[str] = stats.get("subjects", [])
+        subject_list: str = ", ".join(subjects) if subjects else "None"
+
+        message = (
             f"📊 Database Stats:\n"
-            f"   • Chunks: {stats.get('total_chunks', 0)}\n"
-            f"   • Subjects: {len(subjects)}\n"
-            f"   • Subjects: {subject_list}"
+            f"   • Chunks:   {stats.get('total_chunks', 0)}\n"
+            f"   • Subjects: {len(subjects)} — {subject_list}"
         )
-        return CommandResult(continue_loop=True, message=message)
-    
-    def _handle_filter_clear(self) -> CommandResult:
-        self.filters["subject"] = None
-        self.filters["module"] = None
-        return CommandResult(continue_loop=True, message="✅ All filters cleared.")
-    
-    def _handle_mode_switch(self, use_cloud: bool) -> CommandResult:
-        """
-        Switch between local and cloud mode.
-        
-        Args:
-            use_cloud: Whether to use cloud LLM
-            
-        Returns:
-            CommandResult with confirmation message
-        """
+        return CommandResult(message=message)
+
+    def _handle_status(self) -> CommandResult:
+        """Show current mode and active filters."""
+        mode: str = "CLOUD" if self.use_cloud else "LOCAL"
+        active = self._active_filter_parts()
+        filter_text: str = ", ".join(active) if active else "none"
+
+        message = (
+            f"ℹ️  Current state:\n"
+            f"   • Mode:    {mode}\n"
+            f"   • Filters: {filter_text}"
+        )
+        return CommandResult(message=message)
+
+    def _handle_mode_switch(self, *, use_cloud: bool) -> CommandResult:
         self.use_cloud = use_cloud
         mode: str = "CLOUD" if use_cloud else "LOCAL"
-        return CommandResult(continue_loop=True, message=f"✅ Switched to {mode} mode.")
-    
-    def _handle_subject_filter(self, user_input: str) -> CommandResult:
+        return CommandResult(message=f"✅ Switched to {mode} mode.")
+
+    # ---- unified filter handler ----
+
+    def _handle_filter(self, key: str, raw_input: str) -> CommandResult:
         """
-        Set subject filter.
-        
+        Set or clear a single filter.
+
         Args:
-            user_input: Raw user input with filter command
-            
-        Returns:
-            CommandResult with confirmation message
+            key: Filter name ("subject" or "module").
+            raw_input: Original (non-lowered) user input so casing is preserved.
         """
-        subject: str = user_input.split(":", 1)[1].strip()
-        self.filters["subject"] = subject if subject else None
+        value: str = raw_input.split(":", 1)[1].strip()
+        self.filters[key] = value or None
         return CommandResult(
-            continue_loop=True,
-            message=f"✅ Subject filter: {subject or 'cleared'}"
+            message=f"✅ {key.title()} filter: {value or 'cleared'}"
         )
-    
-    def _handle_module_filter(self, user_input: str) -> CommandResult:
-        """
-        Set module filter.
-        
-        Args:
-            user_input: Raw user input with filter command
-            
-        Returns:
-            CommandResult with confirmation message
-        """
-        module: str = user_input.split(":", 1)[1].strip()
-        self.filters["module"] = module if module else None
-        return CommandResult(
-            continue_loop=True,
-            message=f"✅ Module filter: {module or 'cleared'}"
-        )
-    
+
+    def _handle_filter_clear(self) -> CommandResult:
+        self.filters = {k: None for k in self.filters}
+        return CommandResult(message="✅ All filters cleared.")
+
     def _handle_help(self) -> CommandResult:
-        """
-        Show help message.
-        
-        Returns:
-            CommandResult with help text
-        """
-        message: str = (
+        message = (
             "\n📖 Available commands:\n"
             "   • Type your question to get an answer\n"
-            "   • 'stats' - Show database statistics\n"
-            "   • 'local' - Switch to local LLM\n"
-            "   • 'cloud' - Switch to cloud LLM\n"
-            "   • 'filter subject: <name>' - Filter by subject\n"
-            "   • 'filter module: <name>' - Filter by module\n"
-            "   • 'help' - Show this help\n"
-            "   • 'quit' or 'exit' - Exit the program\n"
-            "   • 'filter clear' - Clear all filters\n"
+            "   • 'stats'                  — Database statistics\n"
+            "   • 'status'                 — Current mode & filters\n"
+            "   • 'local' / 'cloud'        — Switch LLM mode\n"
+            "   • 'filter subject: <name>' — Filter by subject\n"
+            "   • 'filter module: <name>'  — Filter by module\n"
+            "   • 'filter clear'           — Clear all filters\n"
+            "   • 'help'                   — This help text\n"
+            "   • 'quit' / 'exit'          — Exit the program\n"
         )
-        return CommandResult(continue_loop=True, message=message)
-    
+        return CommandResult(message=message)
+
     def _handle_question(self, question: str) -> CommandResult:
-        """
-        Process a question and generate answer.
-        
-        Args:
-            question: User's question
-            
-        Returns:
-            CommandResult with answer and sources
-        """
-        print("🔍 Searching...")
-        
+        """Process a question and generate an answer."""
         try:
-            # Execute query using query service
-            from models import QueryResult
             result: QueryResult = self.query_service.execute_query(
                 question=question,
                 use_cloud=self.use_cloud,
                 subject_filter=self.filters["subject"],
-                module_filter=self.filters["module"]
+                module_filter=self.filters["module"],
             )
-            
-            # Format response
-            message: str = "\n" + "="*60 + "\n"
-            message += "ANSWER:\n\n"
-            message += result.answer + "\n"
-            
-            # Add sources if enabled
-            if self.config.show_sources_on_answer and result.sources:
-                message += "\n" + "-"*60 + "\n"
-                message += "SOURCES:\n\n"
-                message += ContextAssembler.format_sources_summary(result.sources)
-            
-            message += "\n" + "="*60
-            
-            return CommandResult(continue_loop=True, message=message)
-        
+            message = self._format_answer(result)
+            return CommandResult(message=message)
+
         except LLMError as e:
-            logger.error(f"LLM error: {e}")
-            return CommandResult(
-                continue_loop=True,
-                message=f"\n❌ LLM Error: {e}\n\nThe language model failed to generate an answer. "
-                        f"Try switching modes ('local' or 'cloud') or check your configuration."
-            )
-        
+            logger.error("LLM error: %s", e)
+            return CommandResult(message=(
+                f"\n❌ LLM Error: {e}\n\n"
+                "The language model failed.  "
+                "Try switching modes ('local' / 'cloud') or check your configuration."
+            ))
+
         except RAGError as e:
-            logger.error(f"RAG error: {e}")
-            return CommandResult(
-                continue_loop=True,
-                message=f"\n❌ Search Error: {e}\n\nFailed to search the knowledge base. "
-                        f"Check that documents are properly indexed."
-            )
-        
+            logger.error("RAG error: %s", e)
+            return CommandResult(message=(
+                f"\n❌ Search Error: {e}\n\n"
+                "Failed to search the knowledge base.  "
+                "Check that documents are properly indexed."
+            ))
+
         except QueryError as e:
-            logger.error(f"Query error: {e}")
-            return CommandResult(
-                continue_loop=True,
-                message=f"\n❌ Query Error: {e}\n\nFailed to process your question. "
-                        f"Try rephrasing or type 'help' for assistance."
-            )
-        
-        except Exception as e:
-            logger.exception(f"Unexpected error processing question: {e}")
-            return CommandResult(
-                continue_loop=True,
-                message=f"\n❌ Unexpected Error: {e}\n\nAn unexpected error occurred. "
-                        f"Type 'quit' to exit or try a different question."
-            )
-    
-    def get_prompt(self) -> str:
-        """
-        Get the input prompt string.
-        
-        Returns:
-            Formatted prompt string
-        """
-        mode_display: str = "☁️ CLOUD" if self.use_cloud else "💻 LOCAL"
-        return f"\n❓ [{mode_display}] Ask: "
+            logger.error("Query error: %s", e)
+            return CommandResult(message=(
+                f"\n❌ Query Error: {e}\n\n"
+                "Failed to process your question.  "
+                "Try rephrasing or type 'help' for assistance."
+            ))
+
+        except Exception:
+            logger.exception("Unexpected error processing question")
+            return CommandResult(message=(
+                "\n❌ Unexpected error — see logs for details.\n"
+                "Type 'quit' to exit or try a different question."
+            ))
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _format_answer(self, result: QueryResult) -> str:
+        """Build the formatted answer + optional sources block."""
+        sep = "=" * 60
+        lines: list[str] = [
+            "",
+            sep,
+            "🔍 ANSWER:\n",
+            result.answer,
+        ]
+
+        if self.config.show_sources_on_answer and result.sources:
+            lines += [
+                "",
+                "-" * 60,
+                "📚 SOURCES:\n",
+                ContextAssembler.format_sources_summary(result.sources),
+            ]
+
+        lines.append(sep)
+        return "\n".join(lines)
+
+    def _active_filter_parts(self) -> list[str]:
+        """Return human-readable strings for every active filter."""
+        return [
+            f"{k}={v}" for k, v in self.filters.items() if v is not None
+        ]
