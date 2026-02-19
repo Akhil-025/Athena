@@ -81,6 +81,8 @@ class CommandHandler:
             return self._handle_module_filter(user_input)
         elif inp == "help":
             return self._handle_help()
+        elif inp in ("filter clear", "clear filter", "clear filters"):
+            return self._handle_filter_clear()
         else:
             # It's a question
             return self._handle_question(user_input.strip())
@@ -104,6 +106,11 @@ class CommandHandler:
             f"   • Subjects: {subject_list}"
         )
         return CommandResult(continue_loop=True, message=message)
+    
+    def _handle_filter_clear(self) -> CommandResult:
+        self.filters["subject"] = None
+        self.filters["module"] = None
+        return CommandResult(continue_loop=True, message="✅ All filters cleared.")
     
     def _handle_mode_switch(self, use_cloud: bool) -> CommandResult:
         """
@@ -169,7 +176,8 @@ class CommandHandler:
             "   • 'filter subject: <name>' - Filter by subject\n"
             "   • 'filter module: <name>' - Filter by module\n"
             "   • 'help' - Show this help\n"
-            "   • 'quit' or 'exit' - Exit the program"
+            "   • 'quit' or 'exit' - Exit the program\n"
+            "   • 'filter clear' - Clear all filters\n"
         )
         return CommandResult(continue_loop=True, message=message)
     

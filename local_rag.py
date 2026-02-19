@@ -64,8 +64,11 @@ class MergedLocalRAG:
             raise
 
     def _initialize_embedder(self):
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.embedder = SentenceTransformer(self.model_name, device=device)
+        logger.info(f"✅ Embedding model loaded on {device}: {self.model_name}")
         try:
-            self.embedder = SentenceTransformer(self.model_name)
             logger.info(f"✅ Embedding model loaded: {self.model_name}")
         except Exception as e:
             logger.exception("❌ Failed to load embedding model")
@@ -88,13 +91,31 @@ class MergedLocalRAG:
         return embeddings
 
     def ingest_pdf(self, file_info: Dict[str, str], rebuild_bm25: bool = True) -> int:
-        """Ingest one PDF (file_info must contain 'full_path', 'subject', 'module')."""
+        # Skip if already ingested
+        existing_ids = self.collection.get(ids=[self._chunk_id(file_info, {"page_number": 1, "chunk_number": 1})])
+        if existing_ids and existing_ids.get("ids"):
+            logger.info(f"⏭️ Skipping already ingested: {file_info['file_name']}")
+            return 0
+        file_path = file_info['full_path']
+        ext = os.path.splitext(file_path)[1].lower()
+
         try:
-            file_path = file_info['full_path']
-            chunks = self.pdf_processor.process_pdf(file_path)
+            if ext == ".pdf":
+                chunks = self.pdf_processor.process_pdf(file_path)
+            else:
+                from document_processor import extract_text_from_file
+                pages = extract_text_from_file(file_path)
+                chunks = []
+                for page in pages:
+                    for idx, c in enumerate(self.pdf_processor.semantic_chunking(page["text"]), start=1):
+                        if len(c) < 100 or len(c.split()) < 15:
+                            continue
+                        chunks.append({**page, "chunk_number": idx, "text": c})
+
             if not chunks:
                 logger.warning(f"⚠️ No text extracted from {file_path}")
                 return 0
+
 
             ids, documents, metadatas = [], [], []
             for chunk in chunks:
@@ -202,24 +223,27 @@ class MergedLocalRAG:
                 sims.append(min(1.0, max(0.0, val)))
         return sims
 
-    def hybrid_search(
-        self,
-        query: str,
-        n_results: int = 10,
-        subject_filter: Optional[str] = None,
-        module_filter: Optional[str] = None,
-        semantic_weight: float = 0.7
-    ) -> Dict[str, Any]:
+    def hybrid_search(self, query, n_results=10, subject_filter=None,
+                    module_filter=None, semantic_weight=None):
+        
         """
         Hybrid search: combine semantic (vector) + keyword (BM25).
         Returns top n_results ranked by hybrid score.
         """
+                
+        config = get_config()
+        semantic_weight = semantic_weight if semantic_weight is not None else config.semantic_weight
+
         try:
             # Semantic search
             query_emb = self._embed_texts([query])
             where_filter = {}
-            if subject_filter: where_filter['subject'] = subject_filter
-            if module_filter: where_filter['module'] = module_filter
+            if subject_filter and module_filter:
+                where_filter = {"$and": [{"subject": subject_filter}, {"module": module_filter}]}
+            elif subject_filter:
+                where_filter = {"subject": subject_filter}
+            elif module_filter:
+                where_filter = {"module": module_filter}
 
             semantic_raw = self.collection.query(
                 query_embeddings=query_emb,
@@ -309,9 +333,21 @@ class MergedLocalRAG:
         # else fallback to semantic-only query
         try:
             emb = self._embed_texts([query])
-            results = self.collection.query(query_embeddings=emb, n_results=n_results,
-                                            where={'subject': subject_filter, 'module': module_filter} if (subject_filter or module_filter) else None,
-                                            include=["documents", "metadatas", "distances"])
+            # ---- build proper Chroma where filter ----
+            where_filter = {}
+            if subject_filter and module_filter:
+                where_filter = {"$and": [{"subject": subject_filter}, {"module": module_filter}]}
+            elif subject_filter:
+                where_filter = {"subject": subject_filter}
+            elif module_filter:
+                where_filter = {"module": module_filter}
+
+            results = self.collection.query(
+                query_embeddings=emb,
+                n_results=n_results,
+                where=where_filter if where_filter else None,
+                include=["documents", "metadatas", "distances"]
+            )
             docs = _safe_get_first(results.get('documents', []))
             mds = _safe_get_first(results.get('metadatas', []))
             dists = _safe_get_first(results.get('distances', []))

@@ -6,7 +6,7 @@
   "local_model": {
       "default_engine": "ollama",
       "fallback_engine": "llama-cpp",
-      "ollama_model": "mistral",
+      "ollama_model": "phi3:mini",
       "model_path": null,
       "use_cloud_fallback": true,
       "cloud_fallback_min_confidence": 0.55,
@@ -16,11 +16,13 @@
   },
 
 
-  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "embedding_model": "sentence-transformers/multi-qa-mpnet-base-dot-v1",
+  "semantic_weight": 0.55,
+  
 
   "sanitization": {
     "max_chunk_chars_sent_to_cloud": 1500,
-    "max_chunks_sent_to_cloud": 2,
+    "max_chunks_sent_to_cloud": 5,
     "remove_pii": true
   },
 
@@ -30,7 +32,7 @@
 
   "chroma_persist_dir": "./chroma_db",
   "enable_bm25": true,
-  "embed_batch_size": 32,
+  "embed_batch_size": 128,
   "reload_on_start": false,
   "show_sources_on_answer": true,
 

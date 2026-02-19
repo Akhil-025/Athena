@@ -5,7 +5,7 @@ These are fallbacks when values aren't specified in config.json.
 
 # Search defaults
 DEFAULT_SEARCH_RESULTS = 8
-DEFAULT_SEMANTIC_WEIGHT = 0.7
+DEFAULT_SEMANTIC_WEIGHT = 0.55
 
 # PDF Processing defaults
 DEFAULT_CHUNK_SIZE = 800

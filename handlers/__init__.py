@@ -1,3 +1,5 @@
+#_init__.py
+
 """
 Command handlers for interactive sessions.
 """

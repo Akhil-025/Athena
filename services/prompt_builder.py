@@ -11,37 +11,29 @@ from config import get_config
 class PromptBuilder:
     """Builds prompts for different LLM types and use cases"""
     
-    # System personas for different LLM types
     LOCAL_SYSTEM_PROMPT = (
-        "You are an expert engineering tutor. Use the provided context "
-        "to answer the question accurately and concisely. If the context "
-        "doesn't contain enough information, say so."
+        "You are a precise academic assistant. Answer ONLY using the provided context excerpts. "
+        "If the context does not contain enough information to answer, say exactly: "
+        "'The provided documents do not cover this topic.' "
+        "Do not add outside knowledge. Be specific and cite the source name."
     )
-    
+
     CLOUD_SYSTEM_PROMPT = (
-        "You are Athena — an expert AI study partner. "
-        "Answer the question using ONLY the provided context. "
-        "Be clear, accurate, and helpful."
+        "You are Athena, an expert academic study assistant. "
+        "Answer the question using ONLY the context provided below. "
+        "Structure your answer clearly. If derivations or steps are needed, show them. "
+        "If the answer is not in the context, say so explicitly — do not guess. "
+        "Always mention which source (file name, page) your answer comes from."
     )
-    
+
     @staticmethod
     def build_local_prompt(question: str, context: str) -> str:
-        """
-        Build prompt for local LLM (Ollama, llama-cpp).
-        Local models typically prefer simpler, more direct prompts.
-        
-        Args:
-            question: The user's question
-            context: Formatted context from search results
-            
-        Returns:
-            Complete prompt string
-        """
         return (
             f"{PromptBuilder.LOCAL_SYSTEM_PROMPT}\n\n"
-            f"CONTEXT:\n{context}\n\n"
-            f"QUESTION: {question}\n\n"
-            f"ANSWER:"
+            f"=== CONTEXT FROM YOUR DOCUMENTS ===\n{context}\n"
+            f"=== END CONTEXT ===\n\n"
+            f"Question: {question}\n\n"
+            f"Answer (based only on the above context):"
         )
     
     @staticmethod

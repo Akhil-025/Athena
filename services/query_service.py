@@ -99,7 +99,7 @@ class QueryService:
         sources = search_results.to_source_documents()
         
         # Step 2: Check cache
-        cache_key = self._generate_cache_key(question, sources)
+        cache_key = self._generate_cache_key(question, sources, use_cloud)
         
         try:
             cached_result = load_cached_answer(cache_key)
@@ -123,6 +123,16 @@ class QueryService:
         
         try:
             answer = self.ai.generate_answer(question, sources, use_cloud=use_cloud)
+            if (len(answer.split()) < 15 or
+                answer.strip().startswith("I don't") or
+                answer.strip().startswith("I cannot") or
+                "not in the context" in answer.lower()):
+                if not use_cloud and self.ai.has_cloud_llm():
+                    logger.info("Local answer low quality, falling back to cloud")
+                    try:
+                        answer = self.ai.generate_answer(question, sources, use_cloud=True)
+                    except LLMError:
+                        pass
         except LLMError as e:
             # FIXED: Re-raise LLMError with additional context
             logger.error(f"LLM generation failed: {e}")
@@ -148,14 +158,13 @@ class QueryService:
             total_sources=len(sources)
         )
     
-    def _generate_cache_key(self, question: str, 
-                           sources: list[SourceDocument]) -> str:
-        """Generate cache key from question and sources"""
+    def _generate_cache_key(self, question: str, sources: list, use_cloud: bool) -> str:
         context_ids = [
             f"{s.file_name}:{s.page_number}:{s.chunk_number or 0}"
             for s in sources
         ]
-        return question_hash(question, context_ids)
+        mode = "cloud" if use_cloud else "local"
+        return question_hash(question + mode, context_ids)
     
     def _save_to_cache(self, cache_key: str, answer: str, 
                       sources: list[SourceDocument], use_cloud: bool):
