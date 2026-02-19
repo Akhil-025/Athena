@@ -1,249 +1,384 @@
-# main.py - FIXED: Proper exception handling
+"""
+main.py — Entry point for the Athena RAG system.
 
+Responsibilities:
+  • Application bootstrap and dependency wiring
+  • LLM provider management  (AIIntegration)
+  • Interactive session orchestration (AthenaApp)
+  • CLI parsing and logging setup
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
 import os
 import sys
-import logging
-from typing import Optional
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 from dotenv import load_dotenv
 
-from config import get_config, paths
-from local_rag import MergedLocalRAG
-from pdf_processor import get_pdf_files_recursive
-from models import SourceDocument
-from services import QueryService
+from config import ConfigManager, get_config, paths
+from exceptions import LLMError
 from factories import LLMFactory
 from handlers import CommandHandler
-from exceptions import LLMError, QueryError  # ADDED
+from local_rag import MergedLocalRAG
+from models import SourceDocument
+from pdf_processor import get_pdf_files_recursive
+from services import PromptBuilder, QueryService
 
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(paths.get_log_file("athena_prep"), encoding="utf-8")
-    ]
-)
 logger = logging.getLogger(__name__)
 
-config = get_config()
+__all__ = ["AIIntegration", "AthenaApp", "main"]
 
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_SAMPLE_STRUCTURE: Dict[str, List[str]] = {
+    "CAD_CAM": ["2D_Transformations", "CNC_Programming", "CAD_Algorithms"],
+    "Machine_Design": ["Shafts", "Bearings", "Gears"],
+    "Thermodynamics": ["Heat_Transfer", "Cycles"],
+}
+
+_EXIT_OK = 0
+_EXIT_ERR = 1
+
+
+# ---------------------------------------------------------------------------
+# LLM gateway
+# ---------------------------------------------------------------------------
 
 class AIIntegration:
     """
-    AI Integration - Manages LLM providers and answer generation.
-    Uses Factory Pattern for LLM initialization.
+    Manages LLM provider selection and answer generation.
+
+    Uses :class:`LLMFactory` for construction; callers choose
+    local vs. cloud at query time.
     """
-    
-    def __init__(self, api_key: Optional[str] = None):
+
+    def __init__(self, api_key: Optional[str] = None) -> None:
         """
-        Initialize AI integration with LLM providers.
-        
         Args:
-            api_key: Optional API key for cloud LLM
+            api_key: Optional API key for cloud LLM provider.
         """
-        self.config = get_config()
-        
-        # Use factory to create LLMs
+        self.config: ConfigManager = get_config()
         self.local_llm, self.cloud_llm = LLMFactory.create_llms(api_key)
-    
+
+    # -- properties ------------------------------------------------------
+
+    @property
+    def has_local(self) -> bool:
+        """Whether a local LLM backend is loaded."""
+        return self.local_llm is not None
+
+    @property
+    def has_cloud(self) -> bool:
+        """Whether a cloud LLM backend is configured."""
+        return self.cloud_llm is not None
+
+    # -- public ----------------------------------------------------------
+
     def generate_answer(
         self,
         question: str,
-        sources: list[SourceDocument],
-        use_cloud: bool = False
+        sources: List[SourceDocument],
+        use_cloud: bool = False,
     ) -> str:
         """
-        Generate answer using appropriate LLM.
-        
+        Generate an answer using the appropriate LLM.
+
         Args:
-            question: The user's question
-            sources: List of SourceDocument objects with context
-            use_cloud: Whether to use cloud LLM
-            
+            question:  The user's question.
+            sources:   Retrieved context documents.
+            use_cloud: Prefer the cloud LLM when ``True``.
+
         Returns:
-            Generated answer text
-            
+            Generated answer text.
+
         Raises:
-            LLMError: If no LLM is available or generation fails
+            LLMError: If no LLM is available or generation fails.
         """
-        from services import PromptBuilder
-        
-        # Select LLM - FIXED: Raise exception instead of returning error string
-        if use_cloud and self.cloud_llm:
-            llm = self.cloud_llm
-            logger.info("Using cloud LLM")
-        elif self.local_llm:
-            llm = self.local_llm
-            logger.info("Using local LLM")
-        else:
-            # FIXED: Raise exception instead of returning error string
-            raise LLMError("No LLM available. Enable local or cloud LLM.")
-        
-        # Build prompt using PromptBuilder service
+        llm = self._select_llm(use_cloud)
+
         prompt = PromptBuilder.build_prompt(
             question=question,
             sources=sources,
-            use_cloud=use_cloud
+            use_cloud=use_cloud,
         )
-        
-        # Generate response - FIXED: Proper exception handling
+
         try:
             result = llm.generate(
                 prompt=prompt,
-                timeout=self.config.llm_timeout_seconds
+                timeout=self.config.llm_timeout_seconds,
             )
-            
-            # Extract text from response
-            if isinstance(result, dict):
-                text = result.get("text", "")
-                if result.get("error"):
-                    # FIXED: Raise exception with error details
-                    raise LLMError(f"LLM generation failed: {result['error']}")
-                return text or str(result)
-            else:
-                return str(result)
-                
+            return self._extract_text(result)
+
         except LLMError:
-            # Re-raise LLM errors
             raise
-        except Exception as e:
-            # FIXED: Wrap unexpected errors in LLMError with context
-            logger.exception(f"LLM generation failed: {e}")
-            raise LLMError(f"LLM generation failed: {e}") from e
-    
-    def has_local_llm(self) -> bool:
-        """Check if local LLM is available"""
-        return self.local_llm is not None
-    
-    def has_cloud_llm(self) -> bool:
-        """Check if cloud LLM is available"""
-        return self.cloud_llm is not None
+        except Exception as exc:
+            logger.exception("LLM generation failed")
+            raise LLMError(f"LLM generation failed: {exc}") from exc
 
+    # -- private ---------------------------------------------------------
 
-class AthenaApp:
-    """Main application class for Athena RAG system"""
-    
-    def __init__(self, data_dir: str = "./data", gemini_api_key: Optional[str] = None):
-        """
-        Initialize Athena application.
-        
-        Args:
-            data_dir: Directory containing PDF documents
-            gemini_api_key: Optional API key for Gemini
-        """
-        self.data_dir = data_dir
-        self.rag = None
-        self.ai = AIIntegration(gemini_api_key)
-        self.query_service = None
-        self.setup_data_directory()
+    def _select_llm(self, use_cloud: bool) -> Any:
+        """Return the requested backend or raise :class:`LLMError`."""
+        if use_cloud and self.cloud_llm is not None:
+            logger.info("Using cloud LLM")
+            return self.cloud_llm
 
-    def setup_data_directory(self) -> bool:
-        """Create data directory if it doesn't exist"""
-        if not os.path.exists(self.data_dir):
-            os.makedirs(self.data_dir, exist_ok=True)
-            logger.info("Created data directory: %s", self.data_dir)
-            self._create_sample_structure()
-        return True
+        if self.local_llm is not None:
+            if use_cloud:
+                logger.warning(
+                    "Cloud LLM requested but unavailable — falling back to local"
+                )
+            else:
+                logger.info("Using local LLM")
+            return self.local_llm
 
-    def _create_sample_structure(self):
-        """Create sample folder structure"""
-        sample_structure = {
-            "CAD_CAM": ["2D_Transformations", "CNC_Programming", "CAD_Algorithms"],
-            "Machine_Design": ["Shafts", "Bearings", "Gears"],
-            "Thermodynamics": ["Heat_Transfer", "Cycles"]
-        }
-        for subject, modules in sample_structure.items():
-            for module in modules:
-                os.makedirs(os.path.join(self.data_dir, subject, module), exist_ok=True)
-
-        logger.info("Sample folder structure created under %s", self.data_dir)
-        print("📂 Sample folders created. Add PDFs and re-run.")
-
-    def initialize_rag(self) -> bool:
-        """
-        Initialize RAG system with vector database and query service.
-        
-        Returns:
-            True if initialization successful
-        """
-        logger.info("Initializing RAG...")
-        
-        self.rag = MergedLocalRAG(
-            persist_directory=config.chroma_persist_dir,
-            model_name=config.embedding_model,
-            embed_batch_size=config.embed_batch_size,
-            enable_bm25=config.enable_bm25
+        raise LLMError(
+            "No LLM available.  Enable a local or cloud provider in configuration."
         )
 
-        # Initialize query service
+    @staticmethod
+    def _extract_text(result: Any) -> str:
+        """
+        Normalise an LLM response to a plain string.
+
+        Handles both dict-style ``{"text": ..., "error": ...}`` responses
+        and direct string returns.
+        """
+        if not isinstance(result, dict):
+            return str(result)
+
+        error = result.get("error")
+        if error:
+            raise LLMError(f"LLM returned an error: {error}")
+
+        text = result.get("text")
+        if text:
+            return str(text)
+
+        # Last resort — stringify the whole dict
+        logger.warning("LLM response has no 'text' key: %s", result)
+        return str(result)
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+class AthenaApp:
+    """
+    Top-level orchestrator for the Athena RAG system.
+
+    Typical lifecycle::
+
+        app = AthenaApp(data_dir="./data")
+        app.initialize()            # RAG + LLM + query service
+        app.interactive_session()   # REPL
+    """
+
+    def __init__(
+        self,
+        data_dir: Optional[str] = None,
+        gemini_api_key: Optional[str] = None,
+    ) -> None:
+        """
+        Args:
+            data_dir:       Root directory for documents (falls back to config).
+            gemini_api_key: Optional Gemini API key (overrides env var).
+        """
+        self.config: ConfigManager = get_config()
+        self.data_dir: Path = Path(data_dir or self.config.data_dir).resolve()
+        self.gemini_api_key: Optional[str] = gemini_api_key
+
+        # Populated by initialize()
+        self.rag: Optional[MergedLocalRAG] = None
+        self.ai: Optional[AIIntegration] = None
+        self.query_service: Optional[QueryService] = None
+
+    # -- public API ------------------------------------------------------
+
+    def initialize(self) -> None:
+        """
+        Create the data directory, RAG backend, LLM gateway, and query
+        service.
+
+        Raises:
+            FileNotFoundError: If data dir contains no supported files.
+            RuntimeError:      If RAG or LLM initialisation fails.
+        """
+        self._ensure_data_directory()
+
+        files = get_pdf_files_recursive(str(self.data_dir))
+        if not files:
+            raise FileNotFoundError(
+                f"No supported files in {self.data_dir}.  "
+                "Add documents and re-run."
+            )
+
+        logger.info("Found %d file(s) in %s", len(files), self.data_dir)
+
+        self._initialize_rag()
+        self.ai = AIIntegration(self.gemini_api_key)
         self.query_service = QueryService(self.rag, self.ai)
 
-        stats = self.rag.get_collection_stats()
+        logger.info("Athena initialised — ready for queries")
 
-        if stats.get("total_chunks", 0) == 0 or config.reload_on_start:
-            logger.info("No chunks found or reload requested — ingesting directory")
-            self.rag.ingest_directory(self.data_dir, rebuild_bm25=True)
-        else:
-            logger.info("Using existing DB with %d chunks", stats.get("total_chunks", 0))
-
-        return True
-
-    def interactive_session(self):
+    def interactive_session(self) -> None:
         """
-        Interactive Q&A session.
-        Uses CommandHandler to process all user input.
+        Run the interactive Q&A loop.
+
+        Raises:
+            RuntimeError: If :meth:`initialize` has not been called.
         """
-        if not self.rag:
-            self.initialize_rag()
-        
-        print("\n🧠 ATHENA — Interactive mode (type 'quit' to exit)\n")
-        
-        # Create command handler - delegates ALL command logic
-        handler = CommandHandler(self.query_service, self.rag)
-        
-        # Main loop - just input → handle → display
+        self._require_initialized()
+
+        print("\n\U0001f9e0 ATHENA — Interactive mode (type 'help' for commands)\n")
+
+        handler = CommandHandler(self.query_service, self.rag)  # type: ignore[arg-type]
+
         while True:
             try:
-                # Get user input
                 user_input = input(handler.get_prompt())
-                
-                # Process command using handler
                 result = handler.handle_command(user_input)
-                
-                # Display result message if any
+
                 if result.message:
                     print(result.message)
-                
-                # Check if should continue
+
                 if not result.continue_loop:
                     break
-                    
-            except KeyboardInterrupt:
-                print("\n\n👋 Interrupted. Goodbye!")
+
+            except (KeyboardInterrupt, EOFError):
+                print("\n\nInterrupted — goodbye!")
                 break
-            except Exception as e:
-                logger.exception(f"Unexpected error: {e}")
-                print(f"\n❌ Unexpected error: {e}")
-                print("Type 'quit' to exit or continue asking questions.")
+
+    # -- private ---------------------------------------------------------
+
+    def _require_initialized(self) -> None:
+        """Guard that prevents use before :meth:`initialize`."""
+        if self.rag is None or self.query_service is None:
+            raise RuntimeError(
+                "Call initialize() before starting an interactive session."
+            )
+
+    def _ensure_data_directory(self) -> None:
+        """Create ``data_dir`` and sample sub-folders when missing."""
+        if self.data_dir.exists():
+            return
+
+        logger.info("Creating data directory: %s", self.data_dir)
+        for subject, modules in _SAMPLE_STRUCTURE.items():
+            for module in modules:
+                (self.data_dir / subject / module).mkdir(
+                    parents=True, exist_ok=True
+                )
+
+        logger.info(
+            "Sample folder structure created under %s — "
+            "add documents and re-run",
+            self.data_dir,
+        )
+
+    def _initialize_rag(self) -> None:
+        """Create the RAG backend and conditionally ingest documents."""
+        self.rag = MergedLocalRAG(
+            persist_directory=self.config.chroma_persist_dir,
+            model_name=self.config.embedding_model,
+            embed_batch_size=self.config.embed_batch_size,
+            enable_bm25=self.config.enable_bm25,
+        )
+
+        stats = self.rag.get_collection_stats()
+        total: int = stats.get("total_chunks", 0)
+
+        if total == 0 or self.config.reload_on_start:
+            reason = "reload_on_start=True" if total else "empty database"
+            logger.info("Ingesting documents (%s)", reason)
+            self.rag.ingest_directory(str(self.data_dir), rebuild_bm25=True)
+        else:
+            logger.info(
+                "Existing database contains %d chunks — skipping ingestion",
+                total,
+            )
 
 
-def main():
-    """Main entry point"""
-    gemini_key = os.getenv("GOOGLE_API_KEY")
-    app = AthenaApp(gemini_api_key=gemini_key)
+# ---------------------------------------------------------------------------
+# Logging bootstrap  (only when executed as a script, never on import)
+# ---------------------------------------------------------------------------
 
-    pdfs = get_pdf_files_recursive(app.data_dir)
-    if not pdfs:
-        print("📁 No PDFs found in data/. Add files and rerun.")
-        return
+def _configure_logging() -> None:
+    """Set up root logger with console + rotating file handler."""
+    log_file = Path(paths.get_log_file("athena_prep"))
+    log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    app.initialize_rag()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(str(log_file), encoding="utf-8"),
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Athena — RAG-powered study assistant",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Root directory containing documents (default: from config)",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Google Gemini API key (overrides GOOGLE_API_KEY env var)",
+    )
+    return parser
+
+
+def main() -> int:
+    """
+    Entry point.
+
+    Returns:
+        ``0`` on clean exit, ``1`` on error.
+    """
+    _configure_logging()
+    args = _build_parser().parse_args()
+
+    api_key: Optional[str] = args.api_key or os.getenv("GOOGLE_API_KEY")
+
+    app = AthenaApp(
+        data_dir=args.data_dir,
+        gemini_api_key=api_key,
+    )
+
+    try:
+        app.initialize()
+    except FileNotFoundError as exc:
+        logger.warning("%s", exc)
+        print(f"\n{exc}")
+        return _EXIT_ERR
+    except Exception:
+        logger.exception("Failed to initialise Athena")
+        return _EXIT_ERR
+
     app.interactive_session()
+    return _EXIT_OK
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
