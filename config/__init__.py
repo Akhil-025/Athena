@@ -155,6 +155,16 @@ class ConfigManager:
     @property
     def remove_pii(self) -> bool:
         return self.get('sanitization.remove_pii', True)
+    
+    # === Local Context Limits ===
+    @property
+    def max_chunks_local(self) -> int:
+        return self.get('sanitization.max_chunks_local', 8)
+    @property
+    def max_chunk_chars_local(self) -> int:
+        return self.get('sanitization.max_chunk_chars_local', 4000)
+
+
 
     # === Database ===
     @property

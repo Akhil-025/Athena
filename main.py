@@ -26,7 +26,9 @@ from handlers import CommandHandler
 from local_rag import MergedLocalRAG
 from models import SourceDocument
 from pdf_processor import get_pdf_files_recursive
-from services import PromptBuilder, QueryService
+from services.prompt_builder import PromptBuilder
+from services.query_service import QueryService
+
 
 load_dotenv()
 
@@ -105,10 +107,14 @@ class AIIntegration:
         """
         llm = self._select_llm(use_cloud)
 
-        prompt = PromptBuilder.build_prompt(
+        if use_cloud:
+            builder = PromptBuilder.for_cloud_llm()
+        else:
+            builder = PromptBuilder.for_local_llm()
+
+        prompt = builder.build(
             question=question,
-            sources=sources,
-            use_cloud=use_cloud,
+            sources=sources
         )
 
         try:
